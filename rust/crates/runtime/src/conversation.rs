@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-use memory_client::{MemoryClient, MemoryMessage, MemoryRole};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
@@ -20,6 +19,68 @@ const DEFAULT_MEMORY_RECALL_LIMIT: usize = 5;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+
+/// Role of a message as seen by the memory provider. Mirrors
+/// [`MessageRole`] but lives alongside the memory interface so providers
+/// have a single self-contained contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryRole {
+    User,
+    Assistant,
+    System,
+    Tool,
+}
+
+/// One message forwarded to the memory provider for fact extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryMessage {
+    pub role: MemoryRole,
+    pub content: String,
+}
+
+impl MemoryMessage {
+    #[must_use]
+    pub fn new(role: MemoryRole, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+        }
+    }
+}
+
+/// Error raised by a memory provider. Opaque to the runtime; the runtime
+/// only logs and continues.
+#[derive(Debug)]
+pub struct MemoryError(pub String);
+
+impl Display for MemoryError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MemoryError {}
+
+impl MemoryError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+/// Synchronous memory surface called by [`ConversationRuntime::run_turn`]
+/// before and after each turn. The runtime never retries on failure; it
+/// logs and carries on so a broken store can't take the session down.
+pub trait MemoryProvider: Send {
+    fn recall(
+        &mut self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, MemoryError>;
+
+    fn ingest(&mut self, session_id: &str, messages: &[MemoryMessage]) -> Result<(), MemoryError>;
+}
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +200,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
-    memory_client: Option<Box<dyn MemoryClient>>,
+    memory_client: Option<Box<dyn MemoryProvider>>,
     memory_recall_limit: usize,
 }
 
@@ -198,7 +259,7 @@ where
     #[must_use]
     pub fn with_memory_client(
         mut self,
-        memory_client: Box<dyn MemoryClient>,
+        memory_client: Box<dyn MemoryProvider>,
         recall_limit: usize,
     ) -> Self {
         self.memory_client = Some(memory_client);
@@ -1906,7 +1967,7 @@ mod tests {
 
     #[test]
     fn run_turn_injects_recalled_memory_and_ingests_assistant_reply() {
-        use memory_client::{MemoryClient, MemoryError, MemoryMessage, MemoryRole};
+        use super::{MemoryError, MemoryMessage, MemoryProvider, MemoryRole};
         use std::sync::Mutex;
 
         #[derive(Default)]
@@ -1920,7 +1981,7 @@ mod tests {
             recall_response: Vec<String>,
         }
 
-        impl MemoryClient for MemoryProbe {
+        impl MemoryProvider for MemoryProbe {
             fn recall(
                 &mut self,
                 _session_id: &str,
@@ -2008,24 +2069,24 @@ mod tests {
 
     #[test]
     fn run_turn_tolerates_memory_failures() {
-        use memory_client::{MemoryClient, MemoryError, MemoryMessage};
+        use super::{MemoryError, MemoryMessage, MemoryProvider};
 
         struct BrokenMemory;
-        impl MemoryClient for BrokenMemory {
+        impl MemoryProvider for BrokenMemory {
             fn recall(
                 &mut self,
                 _session_id: &str,
                 _query: &str,
                 _limit: usize,
             ) -> Result<Vec<String>, MemoryError> {
-                Err(MemoryError::Network("sidecar down".into()))
+                Err(MemoryError::new("store down"))
             }
             fn ingest(
                 &mut self,
                 _session_id: &str,
                 _messages: &[MemoryMessage],
             ) -> Result<(), MemoryError> {
-                Err(MemoryError::Network("sidecar down".into()))
+                Err(MemoryError::new("store down"))
             }
         }
 
