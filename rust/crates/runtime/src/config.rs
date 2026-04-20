@@ -66,6 +66,7 @@ pub struct RuntimeFeatureConfig {
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
     memory: MemoryConfig,
+    router: RouterConfig,
 }
 
 /// External memory service integration (e.g. Zep).
@@ -76,6 +77,18 @@ pub struct MemoryConfig {
     api_key: Option<String>,
     user_id: Option<String>,
     recall_limit: Option<u32>,
+}
+
+/// External routing/caching proxy (e.g. `GPTCache` in front of `RouteLLM`).
+/// When enabled, claw bypasses per-model provider detection and sends every
+/// request to `base_url` under the OpenAI-compatible wire protocol using
+/// `model` as the model specifier expected by the proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RouterConfig {
+    enabled: bool,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -327,6 +340,7 @@ impl ConfigLoader {
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             memory: parse_optional_memory_config(&merged_value)?,
+            router: parse_optional_router_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -431,6 +445,11 @@ impl RuntimeConfig {
     pub fn memory(&self) -> &MemoryConfig {
         &self.feature_config.memory
     }
+
+    #[must_use]
+    pub fn router(&self) -> &RouterConfig {
+        &self.feature_config.router
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -505,6 +524,11 @@ impl RuntimeFeatureConfig {
     pub fn memory(&self) -> &MemoryConfig {
         &self.memory
     }
+
+    #[must_use]
+    pub fn router(&self) -> &RouterConfig {
+        &self.router
+    }
 }
 
 impl MemoryConfig {
@@ -531,6 +555,28 @@ impl MemoryConfig {
     #[must_use]
     pub fn recall_limit(&self) -> Option<u32> {
         self.recall_limit
+    }
+}
+
+impl RouterConfig {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 }
 
@@ -951,6 +997,26 @@ fn parse_optional_provider_fallbacks(
     let fallbacks = optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
         .unwrap_or_default();
     Ok(ProviderFallbackConfig { primary, fallbacks })
+}
+
+fn parse_optional_router_config(root: &JsonValue) -> Result<RouterConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RouterConfig::default());
+    };
+    let Some(value) = object.get("router") else {
+        return Ok(RouterConfig::default());
+    };
+    let entry = expect_object(value, "merged settings.router")?;
+    let enabled = optional_bool(entry, "enabled", "merged settings.router")?.unwrap_or(false);
+    let base_url = optional_string(entry, "baseUrl", "merged settings.router")?.map(str::to_string);
+    let api_key = optional_string(entry, "apiKey", "merged settings.router")?.map(str::to_string);
+    let model = optional_string(entry, "model", "merged settings.router")?.map(str::to_string);
+    Ok(RouterConfig {
+        enabled,
+        base_url,
+        api_key,
+        model,
+    })
 }
 
 fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, ConfigError> {
@@ -1559,6 +1625,59 @@ mod tests {
         // then
         let roots = loaded.trusted_roots();
         assert_eq!(roots, ["/tmp/worktrees", "/home/user/projects"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_router_block_from_settings() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"router":{"enabled":true,"baseUrl":"http://127.0.0.1:8000/v1","apiKey":"sk-test","model":"router-mf-0.11593"}}"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let router = loaded.router();
+        assert!(router.enabled());
+        assert_eq!(router.base_url(), Some("http://127.0.0.1:8000/v1"));
+        assert_eq!(router.api_key(), Some("sk-test"));
+        assert_eq!(router.model(), Some("router-mf-0.11593"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn router_config_defaults_to_disabled_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let router = loaded.router();
+        assert!(!router.enabled());
+        assert!(router.base_url().is_none());
+        assert!(router.model().is_none());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

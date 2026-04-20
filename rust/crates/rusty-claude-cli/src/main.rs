@@ -26,8 +26,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -6700,6 +6701,7 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let router_override = build_router_override(feature_config.router());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -6710,6 +6712,7 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            router_override,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -6728,6 +6731,30 @@ fn build_runtime_with_plugin_state(
         runtime = runtime.with_memory_client(memory_client, recall_limit);
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+}
+
+fn build_router_override(config: &runtime::RouterConfig) -> Option<RouterOverride> {
+    if !config.enabled() {
+        return None;
+    }
+    let Some(base_url) = config.base_url() else {
+        eprintln!("warning: router.enabled is true but router.baseUrl is unset; skipping");
+        return None;
+    };
+    let Some(model) = config.model() else {
+        eprintln!("warning: router.enabled is true but router.model is unset; skipping");
+        return None;
+    };
+    // Most OpenAI-compat proxies (GPTCache, RouteLLM, LiteLLM) accept an
+    // empty bearer token when they handle upstream credentials themselves.
+    // We still send *something* because `OpenAiCompatClient` always emits an
+    // `Authorization` header.
+    let api_key = config.api_key().unwrap_or("sk-router").to_string();
+    Some(RouterOverride {
+        base_url: base_url.to_string(),
+        api_key,
+        model: model.to_string(),
+    })
 }
 
 fn build_memory_client(
@@ -6852,11 +6879,23 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 // `detect_provider_kind(&model)`. The struct name is kept to avoid
 // churning `BuiltRuntime` and every Deref/DerefMut site that references
 // it. See ROADMAP #29 for the provider-dispatch routing fix.
+/// Configured routing proxy (e.g. `GPTCache` fronting `RouteLLM`) that
+/// short-circuits per-model provider detection. Built from
+/// [`runtime::RouterConfig`] at CLI boot.
+#[derive(Debug, Clone)]
+struct RouterOverride {
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
     session_id: String,
     model: String,
+    user_model: String,
+    router_enabled: bool,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -6866,6 +6905,7 @@ struct AnthropicRuntimeClient {
 }
 
 impl AnthropicRuntimeClient {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_id: &str,
         model: String,
@@ -6874,6 +6914,7 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        router: Option<RouterOverride>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
@@ -6894,34 +6935,51 @@ impl AnthropicRuntimeClient {
         // session-scoped prompt cache on the Anthropic path; the
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
-        let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-            }
+        let user_model = model.clone();
+        let (client, effective_model) = if let Some(router) = router {
+            // Router override: all requests go to the configured proxy
+            // (GPTCache / RouteLLM / LiteLLM / etc.) under the OpenAI-compat
+            // wire protocol. The proxy is responsible for picking the
+            // actual upstream model; claw just hands it `router.model`
+            // (e.g. `router-mf-0.11593`) and observes the real model via
+            // the `MessageStart` event's `message.model` field.
+            let inner = OpenAiCompatClient::new(router.api_key, OpenAiCompatConfig::openai())
+                .with_base_url(router.base_url);
+            (ApiProviderClient::OpenAi(inner), router.model)
+        } else {
+            let resolved_model = api::resolve_model_alias(&model);
+            let client = match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => {
+                    let auth = resolve_cli_auth_source()?;
+                    let inner = AnthropicClient::from_auth(auth)
+                        .with_base_url(api::read_base_url())
+                        .with_prompt_cache(PromptCache::new(session_id));
+                    ApiProviderClient::Anthropic(inner)
+                }
+                ProviderKind::Xai | ProviderKind::OpenAi => {
+                    // The api crate's `ProviderClient::from_model_with_anthropic_auth`
+                    // with `None` for the anthropic auth routes via
+                    // `detect_provider_kind` and builds an
+                    // `OpenAiCompatClient::from_env` with the matching
+                    // `OpenAiCompatConfig` (openai / xai / dashscope).
+                    // That reads the correct API-key env var and BASE_URL
+                    // override internally, so this one call covers OpenAI,
+                    // OpenRouter, xAI, DashScope, Ollama, and any other
+                    // OpenAI-compat endpoint users configure via
+                    // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                }
+            };
+            (client, resolved_model)
         };
+        let router_enabled = user_model != effective_model;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
-            model,
+            model: effective_model,
+            user_model,
+            router_enabled,
             enable_tools,
             emit_output,
             allowed_tools,
@@ -7050,6 +7108,12 @@ impl AnthropicRuntimeClient {
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
+                    if self.router_enabled && !start.message.model.is_empty() {
+                        eprintln!(
+                            "[router] user_model={} routed_to={}",
+                            self.user_model, start.message.model
+                        );
+                    }
                     for block in start.message.content {
                         push_output_block(
                             block,

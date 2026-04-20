@@ -201,6 +201,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "memory",
         expected: FieldType::Object,
     },
+    FieldSpec {
+        name: "router",
+        expected: FieldType::Object,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -261,6 +265,25 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "maxOutputTokens",
         expected: FieldType::Number,
+    },
+];
+
+const ROUTER_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "baseUrl",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "apiKey",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "model",
+        expected: FieldType::String,
     },
 ];
 
@@ -533,6 +556,15 @@ pub fn validate_config_file(
             memory,
             MEMORY_FIELDS,
             "memory",
+            source,
+            &path_display,
+        ));
+    }
+    if let Some(router) = object.get("router").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            router,
+            ROUTER_FIELDS,
+            "router",
             source,
             &path_display,
         ));
