@@ -10,7 +10,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -180,6 +180,7 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -259,6 +260,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_path,
             output_format,
         } => run_export(&session_reference, output_path.as_deref(), output_format)?,
+        CliAction::Eval {
+            session_reference,
+            output_path,
+            output_format,
+            max_turns,
+        } => run_eval_command(
+            &session_reference,
+            output_path.as_deref(),
+            output_format,
+            max_turns,
+        )?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -354,6 +366,16 @@ enum CliAction {
         session_reference: String,
         output_path: Option<PathBuf>,
         output_format: CliOutputFormat,
+    },
+    /// Replay a recorded session's user turns through the configured router
+    /// (`.claw.json` `router` block) and emit one JSONL record per turn
+    /// capturing which upstream model the router picked, latency, and
+    /// token usage. Writes to stdout or to `output_path` if provided.
+    Eval {
+        session_reference: String,
+        output_path: Option<PathBuf>,
+        output_format: CliOutputFormat,
+        max_turns: Option<usize>,
     },
     Repl {
         model: String,
@@ -680,6 +702,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
+        "eval" => parse_eval_args(&rest[1..], output_format),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -1300,6 +1323,72 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
         session_reference,
         output_path,
         output_format,
+    })
+}
+
+fn parse_eval_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
+    let mut output_path: Option<PathBuf> = None;
+    let mut max_turns: Option<usize> = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--session" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --session".to_string())?;
+                session_reference.clone_from(value);
+                index += 2;
+            }
+            flag if flag.starts_with("--session=") => {
+                session_reference = flag[10..].to_string();
+                index += 1;
+            }
+            "--output" | "-o" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("missing value for {}", args[index]))?;
+                output_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            flag if flag.starts_with("--output=") => {
+                output_path = Some(PathBuf::from(&flag[9..]));
+                index += 1;
+            }
+            "--max-turns" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --max-turns".to_string())?;
+                max_turns = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid value for --max-turns: {value}"))?,
+                );
+                index += 2;
+            }
+            flag if flag.starts_with("--max-turns=") => {
+                let raw = &flag[12..];
+                max_turns = Some(
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("invalid value for --max-turns: {raw}"))?,
+                );
+                index += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown eval option: {other}"));
+            }
+            other => {
+                return Err(format!("unexpected eval argument: {other}"));
+            }
+        }
+    }
+
+    Ok(CliAction::Eval {
+        session_reference,
+        output_path,
+        output_format,
+        max_turns,
     })
 }
 
@@ -6135,6 +6224,213 @@ fn run_export(
     Ok(())
 }
 
+/// Accumulated metrics for an eval run. Surfaced as a one-line summary on
+/// stderr after the JSONL stream finishes so pipelines can redirect stdout
+/// to a file and still see the overview.
+#[derive(Debug, Default)]
+struct EvalSummary {
+    total_turns: usize,
+    successful_turns: usize,
+    failures: usize,
+    total_latency_ms: u64,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    model_counts: BTreeMap<String, usize>,
+}
+
+impl EvalSummary {
+    fn record_success(
+        &mut self,
+        model: &str,
+        latency_ms: u64,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) {
+        self.total_turns += 1;
+        self.successful_turns += 1;
+        self.total_latency_ms += latency_ms;
+        self.total_input_tokens += u64::from(input_tokens);
+        self.total_output_tokens += u64::from(output_tokens);
+        *self.model_counts.entry(model.to_string()).or_insert(0) += 1;
+    }
+
+    fn record_failure(&mut self) {
+        self.total_turns += 1;
+        self.failures += 1;
+    }
+
+    fn render(&self) -> String {
+        let avg_latency = if self.successful_turns == 0 {
+            0
+        } else {
+            self.total_latency_ms / self.successful_turns as u64
+        };
+        let mut parts = vec![
+            format!("turns={}", self.total_turns),
+            format!("ok={}", self.successful_turns),
+            format!("failed={}", self.failures),
+            format!("avg_latency_ms={avg_latency}"),
+            format!(
+                "tokens_in={} tokens_out={}",
+                self.total_input_tokens, self.total_output_tokens
+            ),
+        ];
+        if !self.model_counts.is_empty() {
+            let mut pairs: Vec<String> = self
+                .model_counts
+                .iter()
+                .map(|(model, count)| format!("{model}={count}"))
+                .collect();
+            pairs.sort();
+            parts.push(format!("models[{}]", pairs.join(",")));
+        }
+        format!("[eval] {}", parts.join(" "))
+    }
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max_chars).collect();
+    out.push_str("...");
+    out
+}
+
+fn flatten_user_text(message: &ConversationMessage) -> String {
+    let mut combined = String::new();
+    for block in &message.blocks {
+        if let ContentBlock::Text { text } = block {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(text);
+        }
+    }
+    combined
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_eval_command(
+    session_reference: &str,
+    output_path: Option<&Path>,
+    output_format: CliOutputFormat,
+    max_turns: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let router_config = runtime_config.router();
+    let router = build_router_override(router_config).ok_or_else(|| {
+        "eval requires `router.enabled: true` with `router.baseUrl` and `router.model` set in .claw.json"
+            .to_string()
+    })?;
+
+    let (handle, session) = load_session_reference(session_reference)?;
+
+    // Collect user turns along with the cumulative history each one needs so
+    // the router's decision reflects actual conversation depth.
+    let mut plans: Vec<(usize, Vec<ConversationMessage>, String)> = Vec::new();
+    for (index, message) in session.messages.iter().enumerate() {
+        if message.role != MessageRole::User {
+            continue;
+        }
+        let text = flatten_user_text(message);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let history = session.messages[..=index].to_vec();
+        plans.push((index, history, text));
+    }
+
+    if let Some(limit) = max_turns {
+        plans.truncate(limit);
+    }
+
+    let client = OpenAiCompatClient::new(router.api_key.clone(), OpenAiCompatConfig::openai())
+        .with_base_url(router.base_url.clone());
+
+    let tokio_rt = tokio::runtime::Runtime::new()?;
+
+    let mut writer: Box<dyn Write> = match output_path {
+        Some(path) => Box::new(fs::File::create(path)?),
+        None => Box::new(io::stdout()),
+    };
+
+    let mut summary = EvalSummary::default();
+
+    for (turn_index, history, user_text) in plans {
+        let request = MessageRequest {
+            model: router.model.clone(),
+            max_tokens: max_tokens_for_model(&router.model),
+            messages: convert_messages(&history),
+            stream: false,
+            ..Default::default()
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = tokio_rt.block_on(async { client.send_message(&request).await });
+        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        let record = match outcome {
+            Ok(response) => {
+                let input_tokens = response.usage.input_tokens;
+                let output_tokens = response.usage.output_tokens;
+                summary.record_success(&response.model, latency_ms, input_tokens, output_tokens);
+                json!({
+                    "turn_index": turn_index,
+                    "user_input": truncate_for_log(&user_text, 200),
+                    "requested_model": router.model,
+                    "routed_model": response.model,
+                    "latency_ms": latency_ms,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "ok": true,
+                })
+            }
+            Err(error) => {
+                summary.record_failure();
+                json!({
+                    "turn_index": turn_index,
+                    "user_input": truncate_for_log(&user_text, 200),
+                    "requested_model": router.model,
+                    "latency_ms": latency_ms,
+                    "ok": false,
+                    "error": error.to_string(),
+                })
+            }
+        };
+
+        writeln!(writer, "{}", serde_json::to_string(&record)?)?;
+    }
+
+    writer.flush()?;
+
+    let summary_line = summary.render();
+    eprintln!("{summary_line}");
+
+    if matches!(output_format, CliOutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "eval",
+                "session_id": handle.id,
+                "session_path": handle.path.display().to_string(),
+                "total_turns": summary.total_turns,
+                "successful_turns": summary.successful_turns,
+                "failures": summary.failures,
+                "total_latency_ms": summary.total_latency_ms,
+                "total_input_tokens": summary.total_input_tokens,
+                "total_output_tokens": summary.total_output_tokens,
+                "models": summary.model_counts,
+            }))?
+        );
+    }
+
+    Ok(())
+}
+
 fn render_session_markdown(session: &Session, session_id: &str, session_path: &Path) -> String {
     let mut lines = vec![
         "# Conversation Export".to_string(),
@@ -8530,6 +8826,7 @@ mod tests {
         PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
     };
+    use super::{flatten_user_text, parse_eval_args, truncate_for_log, EvalSummary};
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
@@ -11819,6 +12116,170 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    #[test]
+    fn parse_eval_args_defaults_to_latest_reference() {
+        let parsed = parse_eval_args(&[], CliOutputFormat::Text).expect("empty eval args parse");
+        assert_eq!(
+            parsed,
+            CliAction::Eval {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: None,
+                output_format: CliOutputFormat::Text,
+                max_turns: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eval_args_accepts_session_output_and_max_turns() {
+        let args = vec![
+            "--session".to_string(),
+            "abc123".to_string(),
+            "--output".to_string(),
+            "/tmp/eval.jsonl".to_string(),
+            "--max-turns".to_string(),
+            "42".to_string(),
+        ];
+        let parsed = parse_eval_args(&args, CliOutputFormat::Json).expect("eval args parse");
+        assert_eq!(
+            parsed,
+            CliAction::Eval {
+                session_reference: "abc123".to_string(),
+                output_path: Some(PathBuf::from("/tmp/eval.jsonl")),
+                output_format: CliOutputFormat::Json,
+                max_turns: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eval_args_supports_inline_flag_syntax() {
+        let args = vec![
+            "--session=abc123".to_string(),
+            "--output=/tmp/eval.jsonl".to_string(),
+            "--max-turns=5".to_string(),
+        ];
+        let parsed = parse_eval_args(&args, CliOutputFormat::Text).expect("inline eval args parse");
+        assert_eq!(
+            parsed,
+            CliAction::Eval {
+                session_reference: "abc123".to_string(),
+                output_path: Some(PathBuf::from("/tmp/eval.jsonl")),
+                output_format: CliOutputFormat::Text,
+                max_turns: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eval_args_rejects_invalid_max_turns() {
+        let args = vec!["--max-turns".to_string(), "abc".to_string()];
+        let error =
+            parse_eval_args(&args, CliOutputFormat::Text).expect_err("non-numeric max-turns");
+        assert!(error.contains("invalid value for --max-turns"));
+    }
+
+    #[test]
+    fn parse_eval_args_rejects_unknown_option() {
+        let args = vec!["--bogus".to_string()];
+        let error = parse_eval_args(&args, CliOutputFormat::Text)
+            .expect_err("unknown eval option rejected");
+        assert!(error.contains("unknown eval option"));
+    }
+
+    #[test]
+    fn eval_top_level_subcommand_routes_to_eval_action() {
+        let parsed = parse_args(&[
+            "eval".to_string(),
+            "--session".to_string(),
+            "abc123".to_string(),
+        ])
+        .expect("eval subcommand parses");
+        assert_eq!(
+            parsed,
+            CliAction::Eval {
+                session_reference: "abc123".to_string(),
+                output_path: None,
+                output_format: CliOutputFormat::Text,
+                max_turns: None,
+            }
+        );
+    }
+
+    #[test]
+    fn eval_summary_tracks_success_failure_and_model_distribution() {
+        let mut summary = EvalSummary::default();
+        summary.record_success("claude-haiku-4-5", 120, 100, 40);
+        summary.record_success("claude-haiku-4-5", 90, 200, 30);
+        summary.record_success("claude-opus-4-6", 500, 400, 80);
+        summary.record_failure();
+
+        assert_eq!(summary.total_turns, 4);
+        assert_eq!(summary.successful_turns, 3);
+        assert_eq!(summary.failures, 1);
+        assert_eq!(summary.total_latency_ms, 710);
+        assert_eq!(summary.total_input_tokens, 700);
+        assert_eq!(summary.total_output_tokens, 150);
+
+        let rendered = summary.render();
+        assert!(rendered.contains("turns=4"));
+        assert!(rendered.contains("ok=3"));
+        assert!(rendered.contains("failed=1"));
+        // 710 / 3 successful turns = 236
+        assert!(rendered.contains("avg_latency_ms=236"));
+        assert!(rendered.contains("tokens_in=700"));
+        assert!(rendered.contains("tokens_out=150"));
+        assert!(rendered.contains("claude-haiku-4-5=2"));
+        assert!(rendered.contains("claude-opus-4-6=1"));
+    }
+
+    #[test]
+    fn eval_summary_render_with_only_failures_shows_zero_avg_latency() {
+        let mut summary = EvalSummary::default();
+        summary.record_failure();
+        summary.record_failure();
+        let rendered = summary.render();
+        assert!(rendered.contains("turns=2"));
+        assert!(rendered.contains("ok=0"));
+        assert!(rendered.contains("failed=2"));
+        assert!(rendered.contains("avg_latency_ms=0"));
+    }
+
+    #[test]
+    fn truncate_for_log_appends_ellipsis_past_cap() {
+        let long_input = "a".repeat(300);
+        let truncated = truncate_for_log(&long_input, 200);
+        assert_eq!(truncated.chars().count(), 203);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_for_log_leaves_short_inputs_intact() {
+        assert_eq!(truncate_for_log("  hello  ", 200), "hello");
+    }
+
+    #[test]
+    fn flatten_user_text_joins_text_blocks_and_skips_non_text() {
+        let message = ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "first".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "ignored".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "second".to_string(),
+                },
+            ],
+            usage: None,
+        };
+        assert_eq!(flatten_user_text(&message), "first\nsecond");
     }
 }
 

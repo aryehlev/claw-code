@@ -40,7 +40,43 @@ Lower = more requests to the strong model. Tune via eval.
 
 ## Evaluation
 
-RouteLLM publishes its own eval harness; run it inside the container:
+### Option A — replay your own session history with `claw eval`
+
+Point the router at a saved session and replay every user turn through
+the proxy. claw emits one JSONL record per turn and a summary line on
+stderr. This measures routing behavior against *your* prompts rather
+than a public benchmark.
+
+```sh
+claw eval --session latest --output eval.jsonl
+# stderr: [eval] turns=42 ok=42 failed=0 avg_latency_ms=318 tokens_in=... \
+#         models[claude-haiku-4-5=31,claude-opus-4-6=11]
+```
+
+Flags:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--session <id\|latest>` | `latest` | Session to replay (same references as `claw --resume`). |
+| `--output <path>` | stdout | Write JSONL records to `<path>` instead of stdout. |
+| `--max-turns <n>` | all turns | Cap the number of user turns replayed. |
+| `--output-format {text,json}` | `text` | When `json`, also print a pretty summary object on stdout. |
+
+Each JSONL record:
+
+```json
+{"turn_index": 3, "user_input": "...", "requested_model": "router-mf-0.11593",
+ "routed_model": "claude-haiku-4-5", "latency_ms": 284,
+ "input_tokens": 1840, "output_tokens": 92, "ok": true}
+```
+
+Requires `router.enabled: true` in `.claw.json` — `claw eval` always
+goes through the configured proxy and never touches upstream providers
+directly.
+
+### Option B — RouteLLM's own benchmark harness
+
+RouteLLM ships MT-Bench / MMLU / GSM8K scripts inside the container:
 
 ```sh
 docker exec -it claw-routellm \
