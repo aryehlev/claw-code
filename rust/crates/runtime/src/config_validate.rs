@@ -274,6 +274,10 @@ const ROUTER_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Bool,
     },
     FieldSpec {
+        name: "mode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "baseUrl",
         expected: FieldType::String,
     },
@@ -283,6 +287,22 @@ const ROUTER_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "model",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "candidates",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "epsilonPercent",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "minSamples",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "scoreboardPath",
         expected: FieldType::String,
     },
 ];

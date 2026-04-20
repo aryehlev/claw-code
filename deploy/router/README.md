@@ -1,32 +1,34 @@
-# Router sidecars
+# Router
 
-`docker-compose.yml` brings up the two sidecars that back claw's `router`
-config block:
+claw supports two routing modes, selected via `router.mode` in `.claw.json`.
 
-| Service | Port | Purpose |
-|---|---|---|
-| `gptcache` | 8100 | Semantic cache in front of the router. Hashes/embeds prompts, serves hits locally, forwards misses downstream. |
-| `routellm` | 6060 | Trained prompt classifier that picks between a "strong" and "weak" model per request. Ships with an eval harness on MT-Bench / MMLU / GSM8K. |
+## Mode A — `external` (sidecar proxy)
 
-Request flow:
+Requests flow through a sidecar that both caches and routes:
 
 ```
 claw --> gptcache:8100 --> routellm:6060 --> Anthropic / OpenAI / ...
 ```
 
-## Bring up
+| Service | Port | Purpose |
+|---|---|---|
+| `gptcache` | 8100 | Semantic cache in front of the router. Hashes/embeds prompts, serves hits locally, forwards misses downstream. |
+| `routellm` | 6060 | Pre-trained classifier that picks between a "strong" and "weak" model per request. Ships with an MT-Bench / MMLU / GSM8K eval harness. |
+
+### Bring up
 
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-...
 docker compose -f deploy/router/docker-compose.yml up -d
 ```
 
-Then enable routing in `.claw.json`:
+Enable in `.claw.json`:
 
 ```json
 {
   "router": {
     "enabled": true,
+    "mode": "external",
     "baseUrl": "http://127.0.0.1:8100/v1",
     "apiKey": "sk-router",
     "model": "router-mf-0.11593"
@@ -36,7 +38,81 @@ Then enable routing in `.claw.json`:
 
 `router-mf-0.11593` is a RouteLLM model specifier — `mf` (matrix
 factorization) is the router, `0.11593` is the strong-model threshold.
-Lower = more requests to the strong model. Tune via eval.
+Lower = more requests to the strong model.
+
+## Mode B — `eval-driven` (in-process, no sidecar required)
+
+claw picks the upstream model itself per turn using a scoreboard of
+prior outcomes. No external routing classifier, no opaque decisions —
+the router's choice is explainable (`warm_start` / `explore` /
+`exploit`) and the scoreboard is a plain JSON file you can inspect.
+
+Request flow:
+
+```
+claw (picks model from scoreboard) --> Anthropic / OpenAI / ...
+```
+
+Enable in `.claw.json`:
+
+```json
+{
+  "router": {
+    "enabled": true,
+    "mode": "eval-driven",
+    "candidates": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"],
+    "epsilonPercent": 10,
+    "minSamples": 5,
+    "scoreboardPath": "~/.local/share/claw/router-scoreboard.json"
+  }
+}
+```
+
+### How selection works
+
+For each turn, the router computes a coarse prompt bucket by length
+(`short` < 512 chars, `medium` < 6000 chars, `long` ≥ 6000) and picks
+one candidate using:
+
+1. **Warm-start** — any candidate with fewer than `minSamples`
+   observations in the current bucket gets picked so the scoreboard
+   accumulates baseline data.
+2. **Explore** — with probability `epsilonPercent` / 100 pick a random
+   candidate, to keep adapting when the provider mix shifts.
+3. **Exploit** — otherwise pick the candidate with the highest
+   Laplace-smoothed success rate; tie-breaker is lower average latency.
+
+Each turn logs one line to stderr:
+
+```
+[router] bucket=short selected=claude-haiku-4-5 reason=exploit
+```
+
+Outcome (success = stream completed without error, plus latency and
+token counts) is recorded back to the scoreboard and persisted
+atomically (write-then-rename) after every turn.
+
+### Inspecting the scoreboard
+
+```sh
+jq . ~/.local/share/claw/router-scoreboard.json
+```
+
+Structure: `{bucket: {model: {successes, failures, total_latency_ms, total_input_tokens, total_output_tokens}}}`.
+
+### Seeding from session history
+
+Use `claw eval` to replay historical sessions; each turn's result is
+recorded into the scoreboard so the greedy phase has data to rank on.
+(See `claw eval --help`.)
+
+### Pairing with a cache
+
+Eval-driven mode still works with the GPTCache sidecar — just add
+`"baseUrl": "http://127.0.0.1:8100/v1"` and `"apiKey": "sk-router"` to
+the `router` block. claw's selected model flows through GPTCache on
+the way to the provider, so you keep semantic caching without the
+RouteLLM classifier. RouteLLM becomes optional.
 
 ## Evaluation
 

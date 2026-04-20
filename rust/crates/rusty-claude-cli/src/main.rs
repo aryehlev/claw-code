@@ -30,6 +30,7 @@ use api::{
     ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolDefinition, ToolResultContentBlock,
 };
+use eval_router::{DefaultRng, PromptBucket, RouterScoreboard, Selection};
 
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -6998,6 +6999,7 @@ fn build_runtime_with_plugin_state(
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     let router_override = build_router_override(feature_config.router());
+    let eval_router = build_eval_router(feature_config.router());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -7009,6 +7011,7 @@ fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             progress_reporter,
             router_override,
+            eval_router,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -7030,7 +7033,7 @@ fn build_runtime_with_plugin_state(
 }
 
 fn build_router_override(config: &runtime::RouterConfig) -> Option<RouterOverride> {
-    if !config.enabled() {
+    if !config.enabled() || config.mode() != runtime::RouterMode::External {
         return None;
     }
     let Some(base_url) = config.base_url() else {
@@ -7050,6 +7053,68 @@ fn build_router_override(config: &runtime::RouterConfig) -> Option<RouterOverrid
         base_url: base_url.to_string(),
         api_key,
         model: model.to_string(),
+    })
+}
+
+/// Default scoreboard location when `router.scoreboardPath` is unset.
+/// Mirrors the session store's per-user data dir so multiple workspaces
+/// share one scoreboard unless the user overrides it.
+fn default_scoreboard_path() -> Option<PathBuf> {
+    env::var_os("XDG_DATA_HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join("claw")
+                .join("router-scoreboard.json")
+        })
+        .or_else(|| {
+            env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join("claw")
+                    .join("router-scoreboard.json")
+            })
+        })
+}
+
+fn build_eval_router(config: &runtime::RouterConfig) -> Option<EvalRouterState> {
+    if !config.enabled() || config.mode() != runtime::RouterMode::EvalDriven {
+        return None;
+    }
+    if config.candidates().is_empty() {
+        eprintln!(
+            "warning: router.mode=eval-driven requires router.candidates with at least one model; skipping"
+        );
+        return None;
+    }
+    let scoreboard_path = config
+        .scoreboard_path()
+        .map(PathBuf::from)
+        .or_else(default_scoreboard_path);
+    let Some(scoreboard_path) = scoreboard_path else {
+        eprintln!(
+            "warning: router.mode=eval-driven requires router.scoreboardPath when HOME/XDG_DATA_HOME are unset; skipping"
+        );
+        return None;
+    };
+    let scoreboard = match RouterScoreboard::load(&scoreboard_path) {
+        Ok(board) => board,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to load router scoreboard at {}: {error}; starting empty",
+                scoreboard_path.display()
+            );
+            RouterScoreboard::in_memory()
+        }
+    };
+    let epsilon = config.epsilon().unwrap_or(0.1).clamp(0.0, 1.0);
+    let min_samples = config.min_samples().unwrap_or(5);
+    Some(EvalRouterState {
+        scoreboard,
+        candidates: config.candidates().to_vec(),
+        epsilon,
+        min_samples,
+        rng: DefaultRng::from_system_time(),
     })
 }
 
@@ -7185,6 +7250,94 @@ struct RouterOverride {
     model: String,
 }
 
+/// Eval-driven in-process router state. Lives on `AnthropicRuntimeClient`
+/// so `ApiClient::stream` can consult the scoreboard per turn and record
+/// the outcome after the stream completes.
+struct EvalRouterState {
+    scoreboard: RouterScoreboard,
+    candidates: Vec<String>,
+    epsilon: f64,
+    min_samples: u32,
+    rng: DefaultRng,
+}
+
+impl EvalRouterState {
+    fn select(&mut self, bucket: PromptBucket) -> Option<Selection> {
+        match self.scoreboard.select(
+            bucket,
+            &self.candidates,
+            self.epsilon,
+            self.min_samples,
+            &mut self.rng,
+        ) {
+            Ok(selection) => Some(selection),
+            Err(error) => {
+                eprintln!("warning: eval router selection failed: {error}");
+                None
+            }
+        }
+    }
+
+    fn record(
+        &mut self,
+        bucket: PromptBucket,
+        model: &str,
+        success: bool,
+        latency_ms: u64,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) {
+        self.scoreboard.record_outcome(
+            bucket,
+            model,
+            success,
+            latency_ms,
+            input_tokens,
+            output_tokens,
+        );
+        if let Err(error) = self.scoreboard.save() {
+            eprintln!("warning: failed to persist router scoreboard: {error}");
+        }
+    }
+}
+
+/// Length of the latest user message in characters — that's what bucketing
+/// keys off. If the latest message is not from the user we fall back to
+/// the total user-text length so a tool-result continuation still gets a
+/// stable bucket.
+fn prompt_bucket_for_request(request: &ApiRequest) -> PromptBucket {
+    use runtime::MessageRole as RtRole;
+    let latest_user_len = request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == RtRole::User)
+        .map_or(0, |message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    runtime::ContentBlock::Text { text } => Some(text.chars().count()),
+                    _ => None,
+                })
+                .sum::<usize>()
+        });
+    PromptBucket::from_prompt_chars(latest_user_len)
+}
+
+/// Extract the cumulative input/output token counts from the last
+/// [`AssistantEvent::Usage`] emitted during a turn, if any.
+fn tokens_from_events(events: &[AssistantEvent]) -> (u32, u32) {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AssistantEvent::Usage(usage) => Some((usage.input_tokens, usage.output_tokens)),
+            _ => None,
+        })
+        .unwrap_or((0, 0))
+}
+
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
@@ -7192,6 +7345,7 @@ struct AnthropicRuntimeClient {
     model: String,
     user_model: String,
     router_enabled: bool,
+    eval_router: Option<EvalRouterState>,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -7211,6 +7365,7 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
         router: Option<RouterOverride>,
+        eval_router: Option<EvalRouterState>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
@@ -7268,7 +7423,7 @@ impl AnthropicRuntimeClient {
             };
             (client, resolved_model)
         };
-        let router_enabled = user_model != effective_model;
+        let router_enabled = user_model != effective_model || eval_router.is_some();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -7276,6 +7431,7 @@ impl AnthropicRuntimeClient {
             model: effective_model,
             user_model,
             router_enabled,
+            eval_router,
             enable_tools,
             emit_output,
             allowed_tools,
@@ -7305,9 +7461,35 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+
+        // If the eval-driven router is active, consult its scoreboard
+        // *before* we build the outgoing request so we can override the
+        // model string. We remember `(bucket, selected_model)` so we can
+        // attribute the outcome back to the right row after the stream
+        // completes.
+        let routed: Option<(PromptBucket, String)> = if let Some(router) = self.eval_router.as_mut()
+        {
+            let bucket = prompt_bucket_for_request(&request);
+            match router.select(bucket) {
+                Some(selection) => {
+                    eprintln!(
+                        "[router] bucket={} selected={} reason={}",
+                        selection.bucket, selection.model, selection.reason
+                    );
+                    Some((selection.bucket, selection.model))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let effective_model = routed
+            .as_ref()
+            .map_or_else(|| self.model.clone(), |(_, model)| model.clone());
+
         let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            model: effective_model.clone(),
+            max_tokens: max_tokens_for_model(&effective_model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self
@@ -7319,7 +7501,8 @@ impl ApiClient for AnthropicRuntimeClient {
             ..Default::default()
         };
 
-        self.runtime.block_on(async {
+        let started = Instant::now();
+        let outcome = self.runtime.block_on(async {
             // When resuming after tool execution, apply a stall timeout on the
             // first stream event.  If the model does not respond within the
             // deadline we drop the stalled connection and re-send the request as
@@ -7344,7 +7527,26 @@ impl ApiClient for AnthropicRuntimeClient {
             }
 
             Err(RuntimeError::new("post-tool continuation nudge exhausted"))
-        })
+        });
+
+        if let (Some(router), Some((bucket, model))) = (self.eval_router.as_mut(), routed.as_ref())
+        {
+            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let success = outcome.is_ok();
+            let (input_tokens, output_tokens) = outcome
+                .as_ref()
+                .map_or((0, 0), |events| tokens_from_events(events));
+            router.record(
+                *bucket,
+                model,
+                success,
+                latency_ms,
+                input_tokens,
+                output_tokens,
+            );
+        }
+
+        outcome
     }
 }
 
@@ -8826,7 +9028,10 @@ mod tests {
         PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
     };
-    use super::{flatten_user_text, parse_eval_args, truncate_for_log, EvalSummary};
+    use super::{
+        flatten_user_text, parse_eval_args, prompt_bucket_for_request, tokens_from_events,
+        truncate_for_log, EvalSummary,
+    };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
@@ -12258,6 +12463,111 @@ UU conflicted.rs",
     #[test]
     fn truncate_for_log_leaves_short_inputs_intact() {
         assert_eq!(truncate_for_log("  hello  ", 200), "hello");
+    }
+
+    #[test]
+    fn prompt_bucket_picks_latest_user_message_length() {
+        use eval_router::PromptBucket;
+        use runtime::{ApiRequest, ContentBlock, ConversationMessage, MessageRole};
+
+        // Earlier user message is long, but the latest (what the router
+        // should key on) is short → expect Short.
+        let request = ApiRequest {
+            system_prompt: vec![],
+            messages: vec![
+                ConversationMessage {
+                    role: MessageRole::User,
+                    blocks: vec![ContentBlock::Text {
+                        text: "a".repeat(10_000),
+                    }],
+                    usage: None,
+                },
+                ConversationMessage {
+                    role: MessageRole::Assistant,
+                    blocks: vec![ContentBlock::Text {
+                        text: "ok".to_string(),
+                    }],
+                    usage: None,
+                },
+                ConversationMessage {
+                    role: MessageRole::User,
+                    blocks: vec![ContentBlock::Text {
+                        text: "hi".to_string(),
+                    }],
+                    usage: None,
+                },
+            ],
+        };
+        assert_eq!(prompt_bucket_for_request(&request), PromptBucket::Short);
+    }
+
+    #[test]
+    fn prompt_bucket_defaults_to_short_when_no_user_messages() {
+        use eval_router::PromptBucket;
+        use runtime::ApiRequest;
+
+        let request = ApiRequest {
+            system_prompt: vec![],
+            messages: vec![],
+        };
+        assert_eq!(prompt_bucket_for_request(&request), PromptBucket::Short);
+    }
+
+    #[test]
+    fn prompt_bucket_counts_chars_across_multiple_text_blocks() {
+        use eval_router::PromptBucket;
+        use runtime::{ApiRequest, ContentBlock, ConversationMessage, MessageRole};
+
+        let request = ApiRequest {
+            system_prompt: vec![],
+            messages: vec![ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![
+                    ContentBlock::Text {
+                        text: "a".repeat(400),
+                    },
+                    ContentBlock::Text {
+                        text: "b".repeat(200),
+                    },
+                ],
+                usage: None,
+            }],
+        };
+        // 600 total chars → Medium bucket (>=512, <6000).
+        assert_eq!(prompt_bucket_for_request(&request), PromptBucket::Medium);
+    }
+
+    #[test]
+    fn tokens_from_events_returns_last_usage_event() {
+        use runtime::TokenUsage;
+
+        let events = vec![
+            AssistantEvent::TextDelta("partial".to_string()),
+            AssistantEvent::Usage(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            AssistantEvent::TextDelta("more".to_string()),
+            AssistantEvent::Usage(TokenUsage {
+                input_tokens: 120,
+                output_tokens: 75,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            AssistantEvent::MessageStop,
+        ];
+        assert_eq!(tokens_from_events(&events), (120, 75));
+    }
+
+    #[test]
+    fn tokens_from_events_returns_zero_when_no_usage_events() {
+        let events = vec![
+            AssistantEvent::TextDelta("hello".to_string()),
+            AssistantEvent::MessageStop,
+        ];
+        assert_eq!(tokens_from_events(&events), (0, 0));
     }
 
     #[test]

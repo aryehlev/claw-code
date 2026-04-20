@@ -14,6 +14,7 @@ api = { path = "../api" }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }
 crossterm = "0.28"
+eval-router = { path = "../eval-router" }
 memory-client = { path = "../memory-client" }
 pulldown-cmark = "0.13"
 rustyline = "15"

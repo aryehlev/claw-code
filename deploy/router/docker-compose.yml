@@ -1,26 +1,19 @@
 version: "3.9"
 
-# Sidecars for claw's router integration.
+# Optional sidecars for claw's router.
 #
-# Data flow:  claw  ->  gptcache (semantic cache)  ->  routellm (routing)  ->  upstream providers
+# Required only when `router.mode = "external"` in .claw.json. The
+# `eval-driven` mode runs entirely in-process and does not need either
+# service — see deploy/router/README.md.
 #
-# claw points at gptcache via .claw.json:
-#   {
-#     "router": {
-#       "enabled": true,
-#       "baseUrl": "http://127.0.0.1:8100/v1",
-#       "apiKey": "sk-router",
-#       "model": "router-mf-0.11593"
-#     }
-#   }
+# External-mode data flow:
+#   claw --> gptcache:8100 --> routellm:6060 --> upstream providers
 #
 # Bring up:   docker compose -f deploy/router/docker-compose.yml up -d
 # Tear down:  docker compose -f deploy/router/docker-compose.yml down
 #
-# Evaluation: RouteLLM ships its own eval scripts. Inside the routellm
-# container run:
-#   python -m routellm.evals.evaluate --routers mf --strong-model claude-opus-4-6 --weak-model claude-haiku-4-5 --benchmark mt-bench
-# Results are written to routellm/evals/results/ in the mounted volume.
+# To run gptcache alone (cache only, no RouteLLM):
+#   docker compose -f deploy/router/docker-compose.yml up -d gptcache-direct
 
 services:
   routellm:
