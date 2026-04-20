@@ -6724,7 +6724,44 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
+    if let Some((memory_client, recall_limit)) = build_memory_client(feature_config.memory()) {
+        runtime = runtime.with_memory_client(memory_client, recall_limit);
+    }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+}
+
+fn build_memory_client(
+    config: &runtime::MemoryConfig,
+) -> Option<(Box<dyn memory_client::MemoryClient>, usize)> {
+    if !config.enabled() {
+        return None;
+    }
+    let Some(base_url) = config.base_url() else {
+        eprintln!("warning: memory.enabled is true but memory.baseUrl is unset; skipping");
+        return None;
+    };
+    let Some(user_id) = config.user_id() else {
+        eprintln!("warning: memory.enabled is true but memory.userId is unset; skipping");
+        return None;
+    };
+    let mut zep_config = memory_client::ZepConfig::new(base_url, user_id);
+    if let Some(api_key) = config.api_key() {
+        zep_config = zep_config.with_api_key(api_key);
+    }
+    match memory_client::ZepMemoryClient::new(zep_config) {
+        Ok(client) => {
+            let recall_limit = config
+                .recall_limit()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(5);
+            Some((Box::new(client), recall_limit))
+        }
+        Err(error) => {
+            eprintln!("warning: failed to construct memory client: {error}");
+            None
+        }
+    }
 }
 
 struct CliHookProgressReporter;

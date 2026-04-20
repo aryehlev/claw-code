@@ -65,6 +65,17 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    memory: MemoryConfig,
+}
+
+/// External memory service integration (e.g. Zep).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryConfig {
+    enabled: bool,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    user_id: Option<String>,
+    recall_limit: Option<u32>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -315,6 +326,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            memory: parse_optional_memory_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -414,6 +426,11 @@ impl RuntimeConfig {
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
+
+    #[must_use]
+    pub fn memory(&self) -> &MemoryConfig {
+        &self.feature_config.memory
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -482,6 +499,38 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn memory(&self) -> &MemoryConfig {
+        &self.memory
+    }
+}
+
+impl MemoryConfig {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    #[must_use]
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn recall_limit(&self) -> Option<u32> {
+        self.recall_limit
     }
 }
 
@@ -902,6 +951,28 @@ fn parse_optional_provider_fallbacks(
     let fallbacks = optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
         .unwrap_or_default();
     Ok(ProviderFallbackConfig { primary, fallbacks })
+}
+
+fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(MemoryConfig::default());
+    };
+    let Some(value) = object.get("memory") else {
+        return Ok(MemoryConfig::default());
+    };
+    let entry = expect_object(value, "merged settings.memory")?;
+    let enabled = optional_bool(entry, "enabled", "merged settings.memory")?.unwrap_or(false);
+    let base_url = optional_string(entry, "baseUrl", "merged settings.memory")?.map(str::to_string);
+    let api_key = optional_string(entry, "apiKey", "merged settings.memory")?.map(str::to_string);
+    let user_id = optional_string(entry, "userId", "merged settings.memory")?.map(str::to_string);
+    let recall_limit = optional_u32(entry, "recallLimit", "merged settings.memory")?;
+    Ok(MemoryConfig {
+        enabled,
+        base_url,
+        api_key,
+        user_id,
+        recall_limit,
+    })
 }
 
 fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigError> {
