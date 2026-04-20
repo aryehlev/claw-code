@@ -65,48 +65,55 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
-    state: StateConfig,
+    memory: MemoryConfig,
+    router: RouterConfig,
 }
 
-/// Unified state-store configuration. Replaces the previous
-/// `memory` (Zep REST sidecar) and `router` (GPTCache/RouteLLM) blocks
-/// with a single SQLite-backed store. Everything is opt-in per
-/// sub-feature; setting `state.databasePath` alone is a no-op.
+/// External memory service integration (e.g. Zep).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StateConfig {
-    database_path: Option<String>,
-    router: StateRouterConfig,
-    cache: StateCacheConfig,
-    memory: StateMemoryConfig,
-}
-
-/// Eval-driven in-process router. Claw picks a candidate model per turn
-/// based on a success-rate scoreboard persisted in the state store.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StateRouterConfig {
+pub struct MemoryConfig {
     enabled: bool,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    user_id: Option<String>,
+    recall_limit: Option<u32>,
+}
+
+/// Selection strategy for the router.
+///
+/// * `External` — requests are forwarded to a proxy (`base_url`) using the
+///   fixed `model` specifier the proxy expects. The proxy picks the real
+///   upstream model. This is the default when the `router` block is
+///   present but `mode` is unset.
+/// * `EvalDriven` — claw picks the upstream model itself per turn, using
+///   a success-rate scoreboard built from prior outcomes. `candidates`
+///   must list at least one concrete model name; `base_url` may still be
+///   set if you want requests to go through a cache sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouterMode {
+    #[default]
+    External,
+    EvalDriven,
+}
+
+/// External routing/caching proxy (e.g. `GPTCache` in front of `RouteLLM`).
+/// When enabled, claw bypasses per-model provider detection and sends every
+/// request to `base_url` under the OpenAI-compatible wire protocol using
+/// `model` as the model specifier expected by the proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RouterConfig {
+    enabled: bool,
+    mode: RouterMode,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
     candidates: Vec<String>,
-    /// Exploration rate expressed as a percent (0–100). Stored as an
-    /// integer so the surrounding struct can still derive `Eq`;
-    /// consumers divide by 100.
+    /// Exploration rate for the eval-driven router expressed as a percent
+    /// (0–100). Stored as an integer so `RouterConfig` can still derive
+    /// `Eq`; consumers divide by 100 when they need the float form.
     epsilon_percent: Option<u32>,
     min_samples: Option<u32>,
-}
-
-/// Exact-match request/response cache.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StateCacheConfig {
-    enabled: bool,
-    ttl_seconds: Option<u64>,
-}
-
-/// Durable memory facts surfaced into the system prompt via keyword
-/// recall (FTS5). Semantic recall is a follow-up once an embedding
-/// provider is plugged in.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StateMemoryConfig {
-    enabled: bool,
-    recall_limit: Option<u32>,
+    scoreboard_path: Option<String>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -357,7 +364,8 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
-            state: parse_optional_state_config(&merged_value)?,
+            memory: parse_optional_memory_config(&merged_value)?,
+            router: parse_optional_router_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -459,8 +467,13 @@ impl RuntimeConfig {
     }
 
     #[must_use]
-    pub fn state(&self) -> &StateConfig {
-        &self.feature_config.state
+    pub fn memory(&self) -> &MemoryConfig {
+        &self.feature_config.memory
+    }
+
+    #[must_use]
+    pub fn router(&self) -> &RouterConfig {
+        &self.feature_config.router
     }
 }
 
@@ -533,44 +546,67 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
-    pub fn state(&self) -> &StateConfig {
-        &self.state
-    }
-}
-
-impl StateConfig {
-    #[must_use]
-    pub fn database_path(&self) -> Option<&str> {
-        self.database_path.as_deref()
-    }
-
-    #[must_use]
-    pub fn router(&self) -> &StateRouterConfig {
-        &self.router
-    }
-
-    #[must_use]
-    pub fn cache(&self) -> &StateCacheConfig {
-        &self.cache
-    }
-
-    #[must_use]
-    pub fn memory(&self) -> &StateMemoryConfig {
+    pub fn memory(&self) -> &MemoryConfig {
         &self.memory
     }
 
-    /// True if any sub-feature is enabled. The CLI uses this to decide
-    /// whether to open the SQLite file at all.
     #[must_use]
-    pub fn any_feature_enabled(&self) -> bool {
-        self.router.enabled() || self.cache.enabled() || self.memory.enabled()
+    pub fn router(&self) -> &RouterConfig {
+        &self.router
     }
 }
 
-impl StateRouterConfig {
+impl MemoryConfig {
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    #[must_use]
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn recall_limit(&self) -> Option<u32> {
+        self.recall_limit
+    }
+}
+
+impl RouterConfig {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> RouterMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     #[must_use]
@@ -588,29 +624,10 @@ impl StateRouterConfig {
     pub fn min_samples(&self) -> Option<u32> {
         self.min_samples
     }
-}
-
-impl StateCacheConfig {
-    #[must_use]
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
 
     #[must_use]
-    pub fn ttl_seconds(&self) -> Option<u64> {
-        self.ttl_seconds
-    }
-}
-
-impl StateMemoryConfig {
-    #[must_use]
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    #[must_use]
-    pub fn recall_limit(&self) -> Option<u32> {
-        self.recall_limit
+    pub fn scoreboard_path(&self) -> Option<&str> {
+        self.scoreboard_path.as_deref()
     }
 }
 
@@ -1033,81 +1050,66 @@ fn parse_optional_provider_fallbacks(
     Ok(ProviderFallbackConfig { primary, fallbacks })
 }
 
-fn parse_optional_state_config(root: &JsonValue) -> Result<StateConfig, ConfigError> {
+fn parse_optional_router_config(root: &JsonValue) -> Result<RouterConfig, ConfigError> {
     let Some(object) = root.as_object() else {
-        return Ok(StateConfig::default());
+        return Ok(RouterConfig::default());
     };
-    let Some(value) = object.get("state") else {
-        return Ok(StateConfig::default());
+    let Some(value) = object.get("router") else {
+        return Ok(RouterConfig::default());
     };
-    let entry = expect_object(value, "merged settings.state")?;
-    let database_path =
-        optional_string(entry, "databasePath", "merged settings.state")?.map(str::to_string);
-
-    let router = match entry.get("router") {
-        Some(router_value) => {
-            let router_entry = expect_object(router_value, "merged settings.state.router")?;
-            StateRouterConfig {
-                enabled: optional_bool(router_entry, "enabled", "merged settings.state.router")?
-                    .unwrap_or(false),
-                candidates: optional_string_array(
-                    router_entry,
-                    "candidates",
-                    "merged settings.state.router",
-                )?
-                .unwrap_or_default(),
-                epsilon_percent: optional_u32(
-                    router_entry,
-                    "epsilonPercent",
-                    "merged settings.state.router",
-                )?,
-                min_samples: optional_u32(
-                    router_entry,
-                    "minSamples",
-                    "merged settings.state.router",
-                )?,
-            }
+    let entry = expect_object(value, "merged settings.router")?;
+    let enabled = optional_bool(entry, "enabled", "merged settings.router")?.unwrap_or(false);
+    let mode = match optional_string(entry, "mode", "merged settings.router")? {
+        None => RouterMode::default(),
+        Some("external") => RouterMode::External,
+        Some("eval-driven") => RouterMode::EvalDriven,
+        Some(other) => {
+            return Err(ConfigError::Parse(format!(
+                "merged settings.router.mode: unsupported value {other} (expected \"external\" or \"eval-driven\")"
+            )))
         }
-        None => StateRouterConfig::default(),
     };
+    let base_url = optional_string(entry, "baseUrl", "merged settings.router")?.map(str::to_string);
+    let api_key = optional_string(entry, "apiKey", "merged settings.router")?.map(str::to_string);
+    let model = optional_string(entry, "model", "merged settings.router")?.map(str::to_string);
+    let candidates =
+        optional_string_array(entry, "candidates", "merged settings.router")?.unwrap_or_default();
+    let epsilon_percent = optional_u32(entry, "epsilonPercent", "merged settings.router")?;
+    let min_samples = optional_u32(entry, "minSamples", "merged settings.router")?;
+    let scoreboard_path =
+        optional_string(entry, "scoreboardPath", "merged settings.router")?.map(str::to_string);
+    Ok(RouterConfig {
+        enabled,
+        mode,
+        base_url,
+        api_key,
+        model,
+        candidates,
+        epsilon_percent,
+        min_samples,
+        scoreboard_path,
+    })
+}
 
-    let cache = match entry.get("cache") {
-        Some(cache_value) => {
-            let cache_entry = expect_object(cache_value, "merged settings.state.cache")?;
-            StateCacheConfig {
-                enabled: optional_bool(cache_entry, "enabled", "merged settings.state.cache")?
-                    .unwrap_or(false),
-                ttl_seconds: optional_u64(
-                    cache_entry,
-                    "ttlSeconds",
-                    "merged settings.state.cache",
-                )?,
-            }
-        }
-        None => StateCacheConfig::default(),
+fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(MemoryConfig::default());
     };
-
-    let memory = match entry.get("memory") {
-        Some(memory_value) => {
-            let memory_entry = expect_object(memory_value, "merged settings.state.memory")?;
-            StateMemoryConfig {
-                enabled: optional_bool(memory_entry, "enabled", "merged settings.state.memory")?
-                    .unwrap_or(false),
-                recall_limit: optional_u32(
-                    memory_entry,
-                    "recallLimit",
-                    "merged settings.state.memory",
-                )?,
-            }
-        }
-        None => StateMemoryConfig::default(),
+    let Some(value) = object.get("memory") else {
+        return Ok(MemoryConfig::default());
     };
-
-    Ok(StateConfig {
-        database_path,
-        router,
-        cache,
-        memory,
+    let entry = expect_object(value, "merged settings.memory")?;
+    let enabled = optional_bool(entry, "enabled", "merged settings.memory")?.unwrap_or(false);
+    let base_url = optional_string(entry, "baseUrl", "merged settings.memory")?.map(str::to_string);
+    let api_key = optional_string(entry, "apiKey", "merged settings.memory")?.map(str::to_string);
+    let user_id = optional_string(entry, "userId", "merged settings.memory")?.map(str::to_string);
+    let recall_limit = optional_u32(entry, "recallLimit", "merged settings.memory")?;
+    Ok(MemoryConfig {
+        enabled,
+        base_url,
+        api_key,
+        user_id,
+        recall_limit,
     })
 }
 
@@ -1452,7 +1454,7 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
+        McpServerConfig, McpTransport, ResolvedPermissionMode, RouterMode, RuntimeHookConfig,
         RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
@@ -1700,7 +1702,37 @@ mod tests {
     }
 
     #[test]
-    fn parses_state_block_with_all_sub_features_enabled() {
+    fn parses_router_block_from_settings() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"router":{"enabled":true,"baseUrl":"http://127.0.0.1:8000/v1","apiKey":"sk-test","model":"router-mf-0.11593"}}"#,
+        )
+        .expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let router = loaded.router();
+        assert!(router.enabled());
+        assert_eq!(router.base_url(), Some("http://127.0.0.1:8000/v1"));
+        assert_eq!(router.api_key(), Some("sk-test"));
+        assert_eq!(router.model(), Some("router-mf-0.11593"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_eval_driven_router_with_candidates_and_tuning_knobs() {
+        // given
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".claw");
@@ -1709,37 +1741,27 @@ mod tests {
         fs::write(
             home.join("settings.json"),
             r#"{
-              "state": {
-                "databasePath": "/tmp/claw-state.sqlite",
-                "router": {
-                  "enabled": true,
-                  "candidates": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"],
-                  "epsilonPercent": 15,
-                  "minSamples": 8
-                },
-                "cache": {
-                  "enabled": true,
-                  "ttlSeconds": 3600
-                },
-                "memory": {
-                  "enabled": true,
-                  "recallLimit": 7
-                }
+              "router": {
+                "enabled": true,
+                "mode": "eval-driven",
+                "candidates": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"],
+                "epsilonPercent": 15,
+                "minSamples": 8,
+                "scoreboardPath": "/tmp/claw-scoreboard.json"
               }
             }"#,
         )
         .expect("write settings");
 
+        // when
         let loaded = ConfigLoader::new(&cwd, &home)
             .load()
             .expect("config should load");
 
-        let state = loaded.state();
-        assert_eq!(state.database_path(), Some("/tmp/claw-state.sqlite"));
-        assert!(state.any_feature_enabled());
-
-        let router = state.router();
+        // then
+        let router = loaded.router();
         assert!(router.enabled());
+        assert_eq!(router.mode(), RouterMode::EvalDriven);
         assert_eq!(
             router.candidates(),
             &[
@@ -1748,46 +1770,19 @@ mod tests {
                 "claude-opus-4-6".to_string(),
             ]
         );
-        let eps = router.epsilon().expect("epsilon");
+        // 15 / 100 -> 0.15
+        assert!(router.epsilon().unwrap().abs().partial_cmp(&0.15).is_some());
+        let eps = router.epsilon().unwrap();
         assert!((eps - 0.15).abs() < 1e-9);
         assert_eq!(router.min_samples(), Some(8));
-
-        let cache = state.cache();
-        assert!(cache.enabled());
-        assert_eq!(cache.ttl_seconds(), Some(3600));
-
-        let memory = state.memory();
-        assert!(memory.enabled());
-        assert_eq!(memory.recall_limit(), Some(7));
+        assert_eq!(router.scoreboard_path(), Some("/tmp/claw-scoreboard.json"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
-    fn state_config_defaults_to_all_features_disabled_when_unset() {
-        let root = temp_dir();
-        let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(&home).expect("home config dir");
-        fs::create_dir_all(&cwd).expect("project dir");
-        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
-
-        let loaded = ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect("config should load");
-
-        let state = loaded.state();
-        assert!(!state.any_feature_enabled());
-        assert!(state.database_path().is_none());
-        assert!(!state.router().enabled());
-        assert!(!state.cache().enabled());
-        assert!(!state.memory().enabled());
-
-        fs::remove_dir_all(root).expect("cleanup temp dir");
-    }
-
-    #[test]
-    fn state_sub_features_are_independently_togglable() {
+    fn rejects_unknown_router_mode() {
+        // given
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".claw");
@@ -1795,19 +1790,74 @@ mod tests {
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
             home.join("settings.json"),
-            r#"{"state":{"memory":{"enabled":true}}}"#,
+            r#"{"router":{"enabled":true,"mode":"psychic"}}"#,
         )
         .expect("write settings");
 
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("unknown mode must fail");
+
+        // then
+        let message = error.to_string();
+        assert!(
+            message.contains("router.mode"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("psychic"), "unexpected error: {message}");
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn router_config_mode_defaults_to_external_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"router":{"enabled":true,"baseUrl":"http://127.0.0.1:8100/v1","model":"router-mf-0.2"}}"#,
+        )
+        .expect("write settings");
+
+        // when
         let loaded = ConfigLoader::new(&cwd, &home)
             .load()
             .expect("config should load");
 
-        let state = loaded.state();
-        assert!(state.any_feature_enabled());
-        assert!(state.memory().enabled());
-        assert!(!state.router().enabled());
-        assert!(!state.cache().enabled());
+        // then
+        let router = loaded.router();
+        assert!(router.enabled());
+        assert_eq!(router.mode(), RouterMode::External);
+        assert!(router.candidates().is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn router_config_defaults_to_disabled_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let router = loaded.router();
+        assert!(!router.enabled());
+        assert!(router.base_url().is_none());
+        assert!(router.model().is_none());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -30,9 +30,7 @@ use api::{
     ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolDefinition, ToolResultContentBlock,
 };
-use claw_state::{
-    CacheKey, DefaultRng, MemoryQuery, MemoryScope, PromptBucket, Selection, StateStore,
-};
+use eval_router::{DefaultRng, PromptBucket, RouterScoreboard, Selection};
 
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -6324,23 +6322,16 @@ fn run_eval_command(
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load()?;
-    let state_config = runtime_config.state();
-    if !state_config.router().enabled() || state_config.router().candidates().is_empty() {
-        return Err(
-            "eval requires `state.router.enabled: true` with candidates in .claw.json".into(),
-        );
-    }
-    let bundle = build_state_bundle(state_config).ok_or("failed to open state store for eval")?;
-    let router_config = bundle
-        .router
-        .as_ref()
-        .ok_or("state.router disabled or missing candidates")?;
-    let mut rng = DefaultRng::from_system_time();
+    let router_config = runtime_config.router();
+    let router = build_router_override(router_config).ok_or_else(|| {
+        "eval requires `router.enabled: true` with `router.baseUrl` and `router.model` set in .claw.json"
+            .to_string()
+    })?;
 
     let (handle, session) = load_session_reference(session_reference)?;
 
-    // Collect user turns along with cumulative history so context depth
-    // matches what the live router would see.
+    // Collect user turns along with the cumulative history each one needs so
+    // the router's decision reflects actual conversation depth.
     let mut plans: Vec<(usize, Vec<ConversationMessage>, String)> = Vec::new();
     for (index, message) in session.messages.iter().enumerate() {
         if message.role != MessageRole::User {
@@ -6358,6 +6349,9 @@ fn run_eval_command(
         plans.truncate(limit);
     }
 
+    let client = OpenAiCompatClient::new(router.api_key.clone(), OpenAiCompatConfig::openai())
+        .with_base_url(router.base_url.clone());
+
     let tokio_rt = tokio::runtime::Runtime::new()?;
 
     let mut writer: Box<dyn Write> = match output_path {
@@ -6368,35 +6362,9 @@ fn run_eval_command(
     let mut summary = EvalSummary::default();
 
     for (turn_index, history, user_text) in plans {
-        let bucket = PromptBucket::from_prompt_chars(user_text.chars().count());
-        let selection = match bundle.store.scoreboard().select(
-            bucket,
-            &router_config.candidates,
-            router_config.epsilon,
-            router_config.min_samples,
-            &mut rng,
-        ) {
-            Ok(selection) => selection,
-            Err(error) => {
-                eprintln!("warning: router select failed for turn {turn_index}: {error}");
-                continue;
-            }
-        };
-
-        let client = match ApiProviderClient::from_model(&selection.model) {
-            Ok(client) => client,
-            Err(error) => {
-                eprintln!(
-                    "warning: failed to construct provider for {}: {error}",
-                    selection.model
-                );
-                continue;
-            }
-        };
-
         let request = MessageRequest {
-            model: selection.model.clone(),
-            max_tokens: max_tokens_for_model(&selection.model),
+            model: router.model.clone(),
+            max_tokens: max_tokens_for_model(&router.model),
             messages: convert_messages(&history),
             stream: false,
             ..Default::default()
@@ -6411,20 +6379,10 @@ fn run_eval_command(
                 let input_tokens = response.usage.input_tokens;
                 let output_tokens = response.usage.output_tokens;
                 summary.record_success(&response.model, latency_ms, input_tokens, output_tokens);
-                let _ = bundle.store.scoreboard().record_outcome(
-                    bucket,
-                    &selection.model,
-                    true,
-                    latency_ms,
-                    input_tokens,
-                    output_tokens,
-                );
                 json!({
                     "turn_index": turn_index,
                     "user_input": truncate_for_log(&user_text, 200),
-                    "selected_model": selection.model,
-                    "selection_reason": selection.reason.to_string(),
-                    "bucket": selection.bucket.to_string(),
+                    "requested_model": router.model,
                     "routed_model": response.model,
                     "latency_ms": latency_ms,
                     "input_tokens": input_tokens,
@@ -6434,20 +6392,10 @@ fn run_eval_command(
             }
             Err(error) => {
                 summary.record_failure();
-                let _ = bundle.store.scoreboard().record_outcome(
-                    bucket,
-                    &selection.model,
-                    false,
-                    latency_ms,
-                    0,
-                    0,
-                );
                 json!({
                     "turn_index": turn_index,
                     "user_input": truncate_for_log(&user_text, 200),
-                    "selected_model": selection.model,
-                    "selection_reason": selection.reason.to_string(),
-                    "bucket": selection.bucket.to_string(),
+                    "requested_model": router.model,
                     "latency_ms": latency_ms,
                     "ok": false,
                     "error": error.to_string(),
@@ -7050,34 +6998,8 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
-    let (eval_router, cache_handle, memory): (
-        Option<EvalRouterState>,
-        Option<RequestCache>,
-        Option<(Box<dyn runtime::MemoryProvider>, usize)>,
-    ) = match build_state_bundle(feature_config.state()) {
-        Some(bundle) => {
-            let eval_router = bundle.router.as_ref().map(|config| EvalRouterState {
-                store: Arc::clone(&bundle.store),
-                candidates: config.candidates.clone(),
-                epsilon: config.epsilon,
-                min_samples: config.min_samples,
-                rng: DefaultRng::from_system_time(),
-            });
-            let cache_handle = bundle.cache_ttl_ms.map(|ttl| RequestCache {
-                store: Arc::clone(&bundle.store),
-                ttl_ms: ttl,
-            });
-            let memory = bundle.memory_recall_limit.map(|limit| {
-                let provider: Box<dyn runtime::MemoryProvider> = Box::new(StateMemoryProvider {
-                    store: Arc::clone(&bundle.store),
-                });
-                (provider, limit)
-            });
-            (eval_router, cache_handle, memory)
-        }
-        None => (None, None, None),
-    };
-
+    let router_override = build_router_override(feature_config.router());
+    let eval_router = build_eval_router(feature_config.router());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -7088,8 +7010,8 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            router_override,
             eval_router,
-            cache_handle,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -7104,184 +7026,129 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    if let Some((provider, limit)) = memory {
-        runtime = runtime.with_memory_client(provider, limit);
+    if let Some((memory_client, recall_limit)) = build_memory_client(feature_config.memory()) {
+        runtime = runtime.with_memory_client(memory_client, recall_limit);
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
 
-/// Default on-disk location for the SQLite state file when
-/// `state.databasePath` is unset. Lives under XDG_DATA_HOME (or
-/// ~/.local/share on POSIX) so claw sessions across workspaces share
-/// one scoreboard/cache/memory store.
-fn default_state_db_path() -> Option<PathBuf> {
+fn build_router_override(config: &runtime::RouterConfig) -> Option<RouterOverride> {
+    if !config.enabled() || config.mode() != runtime::RouterMode::External {
+        return None;
+    }
+    let Some(base_url) = config.base_url() else {
+        eprintln!("warning: router.enabled is true but router.baseUrl is unset; skipping");
+        return None;
+    };
+    let Some(model) = config.model() else {
+        eprintln!("warning: router.enabled is true but router.model is unset; skipping");
+        return None;
+    };
+    // Most OpenAI-compat proxies (GPTCache, RouteLLM, LiteLLM) accept an
+    // empty bearer token when they handle upstream credentials themselves.
+    // We still send *something* because `OpenAiCompatClient` always emits an
+    // `Authorization` header.
+    let api_key = config.api_key().unwrap_or("sk-router").to_string();
+    Some(RouterOverride {
+        base_url: base_url.to_string(),
+        api_key,
+        model: model.to_string(),
+    })
+}
+
+/// Default scoreboard location when `router.scoreboardPath` is unset.
+/// Mirrors the session store's per-user data dir so multiple workspaces
+/// share one scoreboard unless the user overrides it.
+fn default_scoreboard_path() -> Option<PathBuf> {
     env::var_os("XDG_DATA_HOME")
-        .map(|home| PathBuf::from(home).join("claw").join("state.sqlite"))
+        .map(|home| {
+            PathBuf::from(home)
+                .join("claw")
+                .join("router-scoreboard.json")
+        })
         .or_else(|| {
             env::var_os("HOME").map(|home| {
                 PathBuf::from(home)
                     .join(".local")
                     .join("share")
                     .join("claw")
-                    .join("state.sqlite")
+                    .join("router-scoreboard.json")
             })
         })
 }
 
-/// Everything the CLI needs from the state store for one session: the
-/// shared connection plus parsed sub-configs. Built once at boot; the
-/// eval router and memory provider clone the `Arc<StateStore>` so they
-/// can issue queries per turn.
-struct StateBundle {
-    store: Arc<StateStore>,
-    router: Option<EvalRouterConfig>,
-    cache_ttl_ms: Option<u64>,
-    memory_recall_limit: Option<usize>,
-}
-
-struct EvalRouterConfig {
-    candidates: Vec<String>,
-    epsilon: f64,
-    min_samples: u32,
-}
-
-fn build_state_bundle(config: &runtime::StateConfig) -> Option<StateBundle> {
-    if !config.any_feature_enabled() {
+fn build_eval_router(config: &runtime::RouterConfig) -> Option<EvalRouterState> {
+    if !config.enabled() || config.mode() != runtime::RouterMode::EvalDriven {
         return None;
     }
-
-    let resolved_path = config
-        .database_path()
+    if config.candidates().is_empty() {
+        eprintln!(
+            "warning: router.mode=eval-driven requires router.candidates with at least one model; skipping"
+        );
+        return None;
+    }
+    let scoreboard_path = config
+        .scoreboard_path()
         .map(PathBuf::from)
-        .or_else(default_state_db_path);
-
-    let store = match resolved_path.as_ref() {
-        Some(path) => match StateStore::open(path) {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!(
-                    "warning: failed to open state store at {}: {error}; falling back to in-memory",
-                    path.display()
-                );
-                match StateStore::in_memory() {
-                    Ok(store) => store,
-                    Err(error) => {
-                        eprintln!("warning: failed to open in-memory state store: {error}");
-                        return None;
-                    }
-                }
-            }
-        },
-        None => match StateStore::in_memory() {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("warning: failed to open in-memory state store: {error}");
-                return None;
-            }
-        },
+        .or_else(default_scoreboard_path);
+    let Some(scoreboard_path) = scoreboard_path else {
+        eprintln!(
+            "warning: router.mode=eval-driven requires router.scoreboardPath when HOME/XDG_DATA_HOME are unset; skipping"
+        );
+        return None;
     };
-    let store = Arc::new(store);
-
-    let router_config = if config.router().enabled() {
-        if config.router().candidates().is_empty() {
-            eprintln!("warning: state.router.enabled with no candidates; router disabled");
-            None
-        } else {
-            Some(EvalRouterConfig {
-                candidates: config.router().candidates().to_vec(),
-                epsilon: config.router().epsilon().unwrap_or(0.1).clamp(0.0, 1.0),
-                min_samples: config.router().min_samples().unwrap_or(5),
-            })
+    let scoreboard = match RouterScoreboard::load(&scoreboard_path) {
+        Ok(board) => board,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to load router scoreboard at {}: {error}; starting empty",
+                scoreboard_path.display()
+            );
+            RouterScoreboard::in_memory()
         }
-    } else {
-        None
     };
-
-    let cache_ttl_ms = if config.cache().enabled() {
-        Some(
-            config
-                .cache()
-                .ttl_seconds()
-                .map(|seconds| seconds.saturating_mul(1_000))
-                .unwrap_or(0),
-        )
-        .filter(|ttl| *ttl > 0)
-        .or(Some(0))
-    } else {
-        None
-    };
-
-    let memory_recall_limit = if config.memory().enabled() {
-        Some(
-            config
-                .memory()
-                .recall_limit()
-                .and_then(|value| usize::try_from(value).ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(5),
-        )
-    } else {
-        None
-    };
-
-    Some(StateBundle {
-        store,
-        router: router_config,
-        cache_ttl_ms,
-        memory_recall_limit,
+    let epsilon = config.epsilon().unwrap_or(0.1).clamp(0.0, 1.0);
+    let min_samples = config.min_samples().unwrap_or(5);
+    Some(EvalRouterState {
+        scoreboard,
+        candidates: config.candidates().to_vec(),
+        epsilon,
+        min_samples,
+        rng: DefaultRng::from_system_time(),
     })
 }
 
-/// Adapter over [`StateStore::memory`] implementing the runtime's
-/// [`runtime::MemoryProvider`] trait. Ingests user + assistant turns
-/// under a per-session scope so cross-session recall returns only
-/// cross-session facts when the caller asks for the global scope.
-struct StateMemoryProvider {
-    store: Arc<StateStore>,
-}
-
-impl runtime::MemoryProvider for StateMemoryProvider {
-    fn recall(
-        &mut self,
-        session_id: &str,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<String>, runtime::MemoryError> {
-        let scope = MemoryScope::Session {
-            id: session_id.to_string(),
-        };
-        let memory = self.store.memory();
-        let facts = memory
-            .recall(MemoryQuery {
-                text: query,
-                scope: Some(&scope),
-                limit,
-            })
-            .map_err(|error| runtime::MemoryError::new(error.to_string()))?;
-        Ok(facts.into_iter().map(|fact| fact.content).collect())
+fn build_memory_client(
+    config: &runtime::MemoryConfig,
+) -> Option<(Box<dyn memory_client::MemoryClient>, usize)> {
+    if !config.enabled() {
+        return None;
     }
-
-    fn ingest(
-        &mut self,
-        session_id: &str,
-        messages: &[runtime::MemoryMessage],
-    ) -> Result<(), runtime::MemoryError> {
-        let scope = MemoryScope::Session {
-            id: session_id.to_string(),
-        };
-        let memory = self.store.memory();
-        for message in messages {
-            if !matches!(
-                message.role,
-                runtime::MemoryRole::User | runtime::MemoryRole::Assistant
-            ) {
-                continue;
-            }
-            memory
-                .insert(scope.clone(), message.content.clone(), &[])
-                .map_err(|error| runtime::MemoryError::new(error.to_string()))?;
+    let Some(base_url) = config.base_url() else {
+        eprintln!("warning: memory.enabled is true but memory.baseUrl is unset; skipping");
+        return None;
+    };
+    let Some(user_id) = config.user_id() else {
+        eprintln!("warning: memory.enabled is true but memory.userId is unset; skipping");
+        return None;
+    };
+    let mut zep_config = memory_client::ZepConfig::new(base_url, user_id);
+    if let Some(api_key) = config.api_key() {
+        zep_config = zep_config.with_api_key(api_key);
+    }
+    match memory_client::ZepMemoryClient::new(zep_config) {
+        Ok(client) => {
+            let recall_limit = config
+                .recall_limit()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(5);
+            Some((Box::new(client), recall_limit))
         }
-        Ok(())
+        Err(error) => {
+            eprintln!("warning: failed to construct memory client: {error}");
+            None
+        }
     }
 }
 
@@ -7373,11 +7240,21 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 // `detect_provider_kind(&model)`. The struct name is kept to avoid
 // churning `BuiltRuntime` and every Deref/DerefMut site that references
 // it. See ROADMAP #29 for the provider-dispatch routing fix.
-/// Eval-driven in-process router state. Wraps the shared
-/// [`StateStore`] handle so per-turn selects and outcome records hit
-/// SQLite directly; no intermediate JSON file, no sidecar.
+/// Configured routing proxy (e.g. `GPTCache` fronting `RouteLLM`) that
+/// short-circuits per-model provider detection. Built from
+/// [`runtime::RouterConfig`] at CLI boot.
+#[derive(Debug, Clone)]
+struct RouterOverride {
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+/// Eval-driven in-process router state. Lives on `AnthropicRuntimeClient`
+/// so `ApiClient::stream` can consult the scoreboard per turn and record
+/// the outcome after the stream completes.
 struct EvalRouterState {
-    store: Arc<StateStore>,
+    scoreboard: RouterScoreboard,
     candidates: Vec<String>,
     epsilon: f64,
     min_samples: u32,
@@ -7386,7 +7263,7 @@ struct EvalRouterState {
 
 impl EvalRouterState {
     fn select(&mut self, bucket: PromptBucket) -> Option<Selection> {
-        match self.store.scoreboard().select(
+        match self.scoreboard.select(
             bucket,
             &self.candidates,
             self.epsilon,
@@ -7410,46 +7287,16 @@ impl EvalRouterState {
         input_tokens: u32,
         output_tokens: u32,
     ) {
-        if let Err(error) = self.store.scoreboard().record_outcome(
+        self.scoreboard.record_outcome(
             bucket,
             model,
             success,
             latency_ms,
             input_tokens,
             output_tokens,
-        ) {
-            eprintln!("warning: failed to record router outcome: {error}");
-        }
-    }
-}
-
-/// Exact-match request/response cache adapter. `ttl_ms = 0` means
-/// entries never expire.
-struct RequestCache {
-    store: Arc<StateStore>,
-    ttl_ms: u64,
-}
-
-impl RequestCache {
-    fn get(&self, key: &CacheKey) -> Option<(String, String)> {
-        match self.store.cache().get(key) {
-            Ok(Some(entry)) => Some((entry.response_json, entry.model)),
-            Ok(None) => None,
-            Err(error) => {
-                eprintln!("warning: cache lookup failed: {error}");
-                None
-            }
-        }
-    }
-
-    fn put(&self, key: &CacheKey, response_json: &str, model: &str) {
-        let ttl = if self.ttl_ms == 0 {
-            None
-        } else {
-            Some(self.ttl_ms)
-        };
-        if let Err(error) = self.store.cache().put(key, response_json, model, ttl) {
-            eprintln!("warning: cache write failed: {error}");
+        );
+        if let Err(error) = self.scoreboard.save() {
+            eprintln!("warning: failed to persist router scoreboard: {error}");
         }
     }
 }
@@ -7497,8 +7344,8 @@ struct AnthropicRuntimeClient {
     session_id: String,
     model: String,
     user_model: String,
+    router_enabled: bool,
     eval_router: Option<EvalRouterState>,
-    cache: Option<RequestCache>,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -7517,9 +7364,10 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        router: Option<RouterOverride>,
         eval_router: Option<EvalRouterState>,
-        cache: Option<RequestCache>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
         // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
         // variants, where xAI and OpenAI both use the OpenAI-compat
@@ -7539,27 +7387,51 @@ impl AnthropicRuntimeClient {
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
         let user_model = model.clone();
-        let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-            }
+        let (client, effective_model) = if let Some(router) = router {
+            // Router override: all requests go to the configured proxy
+            // (GPTCache / RouteLLM / LiteLLM / etc.) under the OpenAI-compat
+            // wire protocol. The proxy is responsible for picking the
+            // actual upstream model; claw just hands it `router.model`
+            // (e.g. `router-mf-0.11593`) and observes the real model via
+            // the `MessageStart` event's `message.model` field.
+            let inner = OpenAiCompatClient::new(router.api_key, OpenAiCompatConfig::openai())
+                .with_base_url(router.base_url);
+            (ApiProviderClient::OpenAi(inner), router.model)
+        } else {
+            let resolved_model = api::resolve_model_alias(&model);
+            let client = match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => {
+                    let auth = resolve_cli_auth_source()?;
+                    let inner = AnthropicClient::from_auth(auth)
+                        .with_base_url(api::read_base_url())
+                        .with_prompt_cache(PromptCache::new(session_id));
+                    ApiProviderClient::Anthropic(inner)
+                }
+                ProviderKind::Xai | ProviderKind::OpenAi => {
+                    // The api crate's `ProviderClient::from_model_with_anthropic_auth`
+                    // with `None` for the anthropic auth routes via
+                    // `detect_provider_kind` and builds an
+                    // `OpenAiCompatClient::from_env` with the matching
+                    // `OpenAiCompatConfig` (openai / xai / dashscope).
+                    // That reads the correct API-key env var and BASE_URL
+                    // override internally, so this one call covers OpenAI,
+                    // OpenRouter, xAI, DashScope, Ollama, and any other
+                    // OpenAI-compat endpoint users configure via
+                    // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                }
+            };
+            (client, resolved_model)
         };
+        let router_enabled = user_model != effective_model || eval_router.is_some();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
-            model: resolved_model,
+            model: effective_model,
             user_model,
+            router_enabled,
             eval_router,
-            cache,
             enable_tools,
             emit_output,
             allowed_tools,
@@ -7734,10 +7606,7 @@ impl AnthropicRuntimeClient {
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
-                    if self.eval_router.is_some()
-                        && !start.message.model.is_empty()
-                        && start.message.model != self.user_model
-                    {
+                    if self.router_enabled && !start.message.model.is_empty() {
                         eprintln!(
                             "[router] user_model={} routed_to={}",
                             self.user_model, start.message.model

@@ -198,7 +198,11 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::StringArray,
     },
     FieldSpec {
-        name: "state",
+        name: "memory",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "router",
         expected: FieldType::Object,
     },
 ];
@@ -264,29 +268,26 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
     },
 ];
 
-const STATE_FIELDS: &[FieldSpec] = &[
-    FieldSpec {
-        name: "databasePath",
-        expected: FieldType::String,
-    },
-    FieldSpec {
-        name: "router",
-        expected: FieldType::Object,
-    },
-    FieldSpec {
-        name: "cache",
-        expected: FieldType::Object,
-    },
-    FieldSpec {
-        name: "memory",
-        expected: FieldType::Object,
-    },
-];
-
-const STATE_ROUTER_FIELDS: &[FieldSpec] = &[
+const ROUTER_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "enabled",
         expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "mode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "baseUrl",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "apiKey",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "model",
+        expected: FieldType::String,
     },
     FieldSpec {
         name: "candidates",
@@ -300,23 +301,28 @@ const STATE_ROUTER_FIELDS: &[FieldSpec] = &[
         name: "minSamples",
         expected: FieldType::Number,
     },
+    FieldSpec {
+        name: "scoreboardPath",
+        expected: FieldType::String,
+    },
 ];
 
-const STATE_CACHE_FIELDS: &[FieldSpec] = &[
+const MEMORY_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "enabled",
         expected: FieldType::Bool,
     },
     FieldSpec {
-        name: "ttlSeconds",
-        expected: FieldType::Number,
+        name: "baseUrl",
+        expected: FieldType::String,
     },
-];
-
-const STATE_MEMORY_FIELDS: &[FieldSpec] = &[
     FieldSpec {
-        name: "enabled",
-        expected: FieldType::Bool,
+        name: "apiKey",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "userId",
+        expected: FieldType::String,
     },
     FieldSpec {
         name: "recallLimit",
@@ -565,41 +571,23 @@ pub fn validate_config_file(
             &path_display,
         ));
     }
-    if let Some(state) = object.get("state").and_then(JsonValue::as_object) {
+    if let Some(memory) = object.get("memory").and_then(JsonValue::as_object) {
         result.merge(validate_object_keys(
-            state,
-            STATE_FIELDS,
-            "state",
+            memory,
+            MEMORY_FIELDS,
+            "memory",
             source,
             &path_display,
         ));
-        if let Some(router) = state.get("router").and_then(JsonValue::as_object) {
-            result.merge(validate_object_keys(
-                router,
-                STATE_ROUTER_FIELDS,
-                "state.router",
-                source,
-                &path_display,
-            ));
-        }
-        if let Some(cache) = state.get("cache").and_then(JsonValue::as_object) {
-            result.merge(validate_object_keys(
-                cache,
-                STATE_CACHE_FIELDS,
-                "state.cache",
-                source,
-                &path_display,
-            ));
-        }
-        if let Some(memory) = state.get("memory").and_then(JsonValue::as_object) {
-            result.merge(validate_object_keys(
-                memory,
-                STATE_MEMORY_FIELDS,
-                "state.memory",
-                source,
-                &path_display,
-            ));
-        }
+    }
+    if let Some(router) = object.get("router").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            router,
+            ROUTER_FIELDS,
+            "router",
+            source,
+            &path_display,
+        ));
     }
 
     result
