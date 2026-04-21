@@ -114,6 +114,10 @@ pub struct RouterConfig {
     epsilon_percent: Option<u32>,
     min_samples: Option<u32>,
     scoreboard_path: Option<String>,
+    /// Exponential decay applied to scoreboard counts on every record.
+    /// `Some(h)` = half-life of `h` hours (e.g. 168 for one week). `None`
+    /// preserves the pre-decay append-forever behavior.
+    half_life_hours: Option<u32>,
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -629,6 +633,11 @@ impl RouterConfig {
     pub fn scoreboard_path(&self) -> Option<&str> {
         self.scoreboard_path.as_deref()
     }
+
+    #[must_use]
+    pub fn half_life_hours(&self) -> Option<u32> {
+        self.half_life_hours
+    }
 }
 
 impl ProviderFallbackConfig {
@@ -1078,6 +1087,7 @@ fn parse_optional_router_config(root: &JsonValue) -> Result<RouterConfig, Config
     let min_samples = optional_u32(entry, "minSamples", "merged settings.router")?;
     let scoreboard_path =
         optional_string(entry, "scoreboardPath", "merged settings.router")?.map(str::to_string);
+    let half_life_hours = optional_u32(entry, "halfLifeHours", "merged settings.router")?;
     Ok(RouterConfig {
         enabled,
         mode,
@@ -1088,6 +1098,7 @@ fn parse_optional_router_config(root: &JsonValue) -> Result<RouterConfig, Config
         epsilon_percent,
         min_samples,
         scoreboard_path,
+        half_life_hours,
     })
 }
 

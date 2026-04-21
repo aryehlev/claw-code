@@ -29,6 +29,55 @@ use serde::{Deserialize, Serialize};
 
 const SCOREBOARD_VERSION: u32 = 1;
 
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| {
+            // Truncation is intentional — we want a stable u64 epoch-ms.
+            #[allow(clippy::cast_possible_truncation)]
+            let ms = duration.as_millis() as u64;
+            ms
+        })
+        .unwrap_or(0)
+}
+
+/// Multiply `successes` / `failures` / `total_latency_ms` by
+/// `0.5 ^ (elapsed_ms / half_life_ms)`. Rows without a prior
+/// observation (loaded from older scoreboards or freshly inserted) are
+/// skipped so decay doesn't punish data that predates the feature.
+fn apply_decay(entry: &mut ModelStats, now_ms: u64, half_life_ms: u64) {
+    if entry.last_observation_ms == 0 || half_life_ms == 0 || now_ms <= entry.last_observation_ms {
+        return;
+    }
+    let elapsed_ms = now_ms.saturating_sub(entry.last_observation_ms);
+    // `0.5 ^ k` = `exp(-k * ln 2)`. We never use more than `elapsed /
+    // half_life` half-lives of decay; even across 100 years of elapsed
+    // time with a 1-hour half-life the exponent is finite and safe in
+    // f64 (factor ≈ 0 well before any overflow).
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = (elapsed_ms as f64) / (half_life_ms as f64);
+    let factor = (-ratio * std::f64::consts::LN_2).exp();
+    entry.successes = decay_count(entry.successes, factor);
+    entry.failures = decay_count(entry.failures, factor);
+    entry.total_latency_ms = decay_count(entry.total_latency_ms, factor);
+}
+
+fn decay_count(value: u64, factor: f64) -> u64 {
+    if factor <= 0.0 || value == 0 {
+        return 0;
+    }
+    if factor >= 1.0 {
+        return value;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let decayed = ((value as f64) * factor).round() as u64;
+    decayed
+}
+
 /// Coarse prompt bucket used as the scoreboard key. Keeping the alphabet
 /// small means the scoreboard converges fast even on small session
 /// corpora; finer-grained bucketing (topic, tool density, …) is a natural
@@ -74,6 +123,13 @@ impl Display for PromptBucket {
 }
 
 /// Aggregated statistics for one candidate model inside a single bucket.
+///
+/// Counts decay toward zero over time when the scoreboard is recorded
+/// against with a non-`None` `half_life_ms` — the exponent is
+/// `0.5 ^ (elapsed_ms / half_life_ms)`, applied to `successes`,
+/// `failures`, and `total_latency_ms` before the new sample is
+/// added. Token totals are not decayed (they're only kept for cost
+/// analysis, not the selection decision).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelStats {
     #[serde(default)]
@@ -86,6 +142,19 @@ pub struct ModelStats {
     pub total_input_tokens: u64,
     #[serde(default)]
     pub total_output_tokens: u64,
+    /// Cumulative provider cost in micro-dollars (10⁻⁶ USD) for this
+    /// (bucket, model) row. Storing an integer keeps the JSON schema
+    /// free of floating-point values; a u64 of micro-dollars holds up to
+    /// ~18 trillion dollars, which is enough headroom. Not decayed — we
+    /// want a faithful lifetime cost figure for the `claw eval` report.
+    #[serde(default)]
+    pub total_cost_micros: u64,
+    /// Unix-millis of the last observation merged into this row.
+    /// Default 0 on rows loaded from pre-decay scoreboards; the first
+    /// recorded outcome after load skips decay so we don't penalize
+    /// historical data simply because it predates the feature.
+    #[serde(default)]
+    pub last_observation_ms: u64,
 }
 
 impl ModelStats {
@@ -114,6 +183,14 @@ impl ModelStats {
         } else {
             self.total_latency_ms / samples
         }
+    }
+
+    /// Cumulative cost in dollars for this (bucket, model) row. Derived
+    /// from `total_cost_micros`.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn total_cost_usd(&self) -> f64 {
+        (self.total_cost_micros as f64) / 1_000_000.0
     }
 }
 
@@ -345,6 +422,9 @@ impl RouterScoreboard {
     /// Record a turn's outcome. `input_tokens` / `output_tokens` are purely
     /// informational (cost analysis); the routing decision itself only
     /// depends on `success`.
+    ///
+    /// Equivalent to [`record_outcome_with_decay`](Self::record_outcome_with_decay)
+    /// called with `half_life_ms = None` and `cost_micros = 0`.
     pub fn record_outcome(
         &mut self,
         bucket: PromptBucket,
@@ -354,6 +434,41 @@ impl RouterScoreboard {
         input_tokens: u32,
         output_tokens: u32,
     ) {
+        self.record_outcome_with_decay(
+            bucket,
+            model,
+            success,
+            latency_ms,
+            input_tokens,
+            output_tokens,
+            0,
+            None,
+        );
+    }
+
+    /// Record a turn's outcome, optionally decaying prior counts first
+    /// and crediting cost against the row.
+    ///
+    /// - `cost_micros`: provider cost for this turn in micro-dollars.
+    ///   Added to the row's lifetime cumulative cost; not decayed.
+    /// - `half_life_ms`: if `Some(h)` and the row has a recorded
+    ///   `last_observation_ms`, existing `successes`, `failures`, and
+    ///   `total_latency_ms` are multiplied by `0.5 ^ (elapsed_ms / h)`
+    ///   before the new sample lands. Passing `None` preserves the
+    ///   pre-decay append-forever behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_outcome_with_decay(
+        &mut self,
+        bucket: PromptBucket,
+        model: &str,
+        success: bool,
+        latency_ms: u64,
+        input_tokens: u32,
+        output_tokens: u32,
+        cost_micros: u64,
+        half_life_ms: Option<u64>,
+    ) {
+        let now_ms = now_unix_ms();
         let entry = self
             .state
             .buckets
@@ -361,10 +476,15 @@ impl RouterScoreboard {
             .or_default()
             .entry(model.to_string())
             .or_default();
+
+        if let Some(half_life) = half_life_ms {
+            apply_decay(entry, now_ms, half_life);
+        }
+
         if success {
-            entry.successes += 1;
+            entry.successes = entry.successes.saturating_add(1);
         } else {
-            entry.failures += 1;
+            entry.failures = entry.failures.saturating_add(1);
         }
         entry.total_latency_ms = entry.total_latency_ms.saturating_add(latency_ms);
         entry.total_input_tokens = entry
@@ -373,6 +493,8 @@ impl RouterScoreboard {
         entry.total_output_tokens = entry
             .total_output_tokens
             .saturating_add(u64::from(output_tokens));
+        entry.total_cost_micros = entry.total_cost_micros.saturating_add(cost_micros);
+        entry.last_observation_ms = now_ms;
     }
 
     /// Pick the model for the next turn.
@@ -618,6 +740,156 @@ mod tests {
         let short = board.stats(PromptBucket::Short, "claude-opus-4-6");
         assert_eq!(short.successes, 1);
         assert_eq!(short.failures, 0);
+    }
+
+    #[test]
+    fn decay_halves_counts_after_one_half_life() {
+        // decay_count is the actual workhorse; verify the math directly
+        // instead of spinning a real clock.
+        assert_eq!(decay_count(100, 0.5), 50);
+        assert_eq!(decay_count(10, 0.25), 3); // 2.5 rounds to 3
+        assert_eq!(decay_count(0, 0.5), 0);
+        assert_eq!(decay_count(1, 1.0), 1);
+        assert_eq!(decay_count(5, 0.0), 0);
+    }
+
+    #[test]
+    fn apply_decay_skips_rows_with_no_prior_observation() {
+        let mut stats = ModelStats {
+            successes: 10,
+            failures: 5,
+            total_latency_ms: 1_000,
+            last_observation_ms: 0, // no prior observation → skip
+            ..Default::default()
+        };
+        apply_decay(&mut stats, 1_000_000, 100_000);
+        assert_eq!(stats.successes, 10);
+        assert_eq!(stats.failures, 5);
+        assert_eq!(stats.total_latency_ms, 1_000);
+    }
+
+    #[test]
+    fn apply_decay_scales_counts_by_half_life_exponent() {
+        let mut stats = ModelStats {
+            successes: 100,
+            failures: 40,
+            total_latency_ms: 10_000,
+            total_input_tokens: 7_777, // not decayed — cost data only
+            total_output_tokens: 3_333,
+            total_cost_micros: 5_000_000, // $5, not decayed
+            last_observation_ms: 1_000,
+        };
+        // One half-life elapsed: factor should be ~0.5.
+        apply_decay(&mut stats, 1_000 + 3_600_000, 3_600_000);
+        assert!(
+            (49..=51).contains(&stats.successes),
+            "expected ~50, got {}",
+            stats.successes
+        );
+        assert!(
+            (19..=21).contains(&stats.failures),
+            "expected ~20, got {}",
+            stats.failures
+        );
+        assert!(
+            (4_900..=5_100).contains(&stats.total_latency_ms),
+            "expected ~5000, got {}",
+            stats.total_latency_ms
+        );
+        // Tokens and cost untouched — decay applies only to counts.
+        assert_eq!(stats.total_input_tokens, 7_777);
+        assert_eq!(stats.total_output_tokens, 3_333);
+        assert_eq!(stats.total_cost_micros, 5_000_000);
+    }
+
+    #[test]
+    fn record_outcome_with_decay_forgets_old_samples() {
+        let mut board = RouterScoreboard::in_memory();
+        // Seed a stale observation from "a year ago" (last_observation_ms
+        // well in the past). Set that directly to avoid waiting on
+        // wall-clock time during the test.
+        {
+            let entry = board
+                .state
+                .buckets
+                .entry(PromptBucket::Short)
+                .or_default()
+                .entry("claude-haiku-4-5".to_string())
+                .or_default();
+            entry.successes = 100;
+            entry.failures = 0;
+            // 30 half-lives in the past: decay factor 2^-30 ≈ 1e-9, so
+            // everything rounds to zero.
+            let thirty_half_lives_ago = now_unix_ms().saturating_sub(30 * 3_600_000);
+            entry.last_observation_ms = thirty_half_lives_ago;
+        }
+
+        board.record_outcome_with_decay(
+            PromptBucket::Short,
+            "claude-haiku-4-5",
+            true,
+            100,
+            10,
+            5,
+            0,
+            Some(3_600_000), // 1-hour half-life
+        );
+        let stats = board.stats(PromptBucket::Short, "claude-haiku-4-5");
+        // All 100 historical successes should have decayed to 0; only
+        // the newly recorded success remains.
+        assert_eq!(stats.successes, 1);
+        assert_eq!(stats.failures, 0);
+    }
+
+    #[test]
+    fn record_outcome_with_decay_accumulates_cost_without_decaying_it() {
+        let mut board = RouterScoreboard::in_memory();
+        board.record_outcome_with_decay(
+            PromptBucket::Short,
+            "claude-haiku-4-5",
+            true,
+            50,
+            100,
+            40,
+            125_000, // $0.125 for this turn
+            Some(3_600_000),
+        );
+        board.record_outcome_with_decay(
+            PromptBucket::Short,
+            "claude-haiku-4-5",
+            true,
+            75,
+            200,
+            80,
+            250_000, // another $0.25
+            Some(3_600_000),
+        );
+        let stats = board.stats(PromptBucket::Short, "claude-haiku-4-5");
+        // Both costs should land even though the row saw decay on its
+        // counts; cost is not among the decayed fields.
+        assert_eq!(stats.total_cost_micros, 375_000);
+        assert!((stats.total_cost_usd() - 0.375).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_outcome_wrapper_does_not_decay() {
+        let mut board = RouterScoreboard::in_memory();
+        // Seed a huge count with an old timestamp.
+        {
+            let entry = board
+                .state
+                .buckets
+                .entry(PromptBucket::Short)
+                .or_default()
+                .entry("claude-opus-4-6".to_string())
+                .or_default();
+            entry.successes = 50;
+            entry.last_observation_ms = 1; // ancient
+        }
+        // The non-decay wrapper should preserve the count.
+        board.record_outcome(PromptBucket::Short, "claude-opus-4-6", true, 100, 10, 5);
+        let stats = board.stats(PromptBucket::Short, "claude-opus-4-6");
+        assert_eq!(stats.successes, 51);
     }
 
     #[test]

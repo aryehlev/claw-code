@@ -6236,6 +6236,9 @@ struct EvalSummary {
     total_latency_ms: u64,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    /// Cumulative provider cost in micro-dollars across every successful
+    /// turn in this eval run.
+    total_cost_micros: u64,
     model_counts: BTreeMap<String, usize>,
 }
 
@@ -6252,12 +6255,22 @@ impl EvalSummary {
         self.total_latency_ms += latency_ms;
         self.total_input_tokens += u64::from(input_tokens);
         self.total_output_tokens += u64::from(output_tokens);
+        self.total_cost_micros = self.total_cost_micros.saturating_add(cost_micros_for(
+            model,
+            input_tokens,
+            output_tokens,
+        ));
         *self.model_counts.entry(model.to_string()).or_insert(0) += 1;
     }
 
     fn record_failure(&mut self) {
         self.total_turns += 1;
         self.failures += 1;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn total_cost_usd(&self) -> f64 {
+        (self.total_cost_micros as f64) / 1_000_000.0
     }
 
     fn render(&self) -> String {
@@ -6275,6 +6288,7 @@ impl EvalSummary {
                 "tokens_in={} tokens_out={}",
                 self.total_input_tokens, self.total_output_tokens
             ),
+            format!("cost=${:.4}", self.total_cost_usd()),
         ];
         if !self.model_counts.is_empty() {
             let mut pairs: Vec<String> = self
@@ -6378,6 +6392,7 @@ fn run_eval_command(
             Ok(response) => {
                 let input_tokens = response.usage.input_tokens;
                 let output_tokens = response.usage.output_tokens;
+                let cost_micros = cost_micros_for(&response.model, input_tokens, output_tokens);
                 summary.record_success(&response.model, latency_ms, input_tokens, output_tokens);
                 json!({
                     "turn_index": turn_index,
@@ -6387,6 +6402,7 @@ fn run_eval_command(
                     "latency_ms": latency_ms,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
+                    "cost_micros": cost_micros,
                     "ok": true,
                 })
             }
@@ -6424,6 +6440,8 @@ fn run_eval_command(
                 "total_latency_ms": summary.total_latency_ms,
                 "total_input_tokens": summary.total_input_tokens,
                 "total_output_tokens": summary.total_output_tokens,
+                "total_cost_micros": summary.total_cost_micros,
+                "total_cost_usd": summary.total_cost_usd(),
                 "models": summary.model_counts,
             }))?
         );
@@ -7109,11 +7127,20 @@ fn build_eval_router(config: &runtime::RouterConfig) -> Option<EvalRouterState> 
     };
     let epsilon = config.epsilon().unwrap_or(0.1).clamp(0.0, 1.0);
     let min_samples = config.min_samples().unwrap_or(5);
+    // Default half-life: one week. Users get sensible forgetting out of
+    // the box; opt out by setting `router.halfLifeHours: 0` in
+    // .claw.json (0 disables decay).
+    let half_life_ms = match config.half_life_hours() {
+        Some(0) => None,
+        Some(hours) => Some(u64::from(hours).saturating_mul(3_600_000)),
+        None => Some(168_u64.saturating_mul(3_600_000)),
+    };
     Some(EvalRouterState {
         scoreboard,
         candidates: config.candidates().to_vec(),
         epsilon,
         min_samples,
+        half_life_ms,
         rng: DefaultRng::from_system_time(),
     })
 }
@@ -7258,14 +7285,34 @@ struct EvalRouterState {
     candidates: Vec<String>,
     epsilon: f64,
     min_samples: u32,
+    /// Scoreboard decay half-life in milliseconds. `None` = no decay
+    /// (append-forever, the pre-decay behavior). Set from
+    /// `router.halfLifeHours` in `.claw.json`.
+    half_life_ms: Option<u64>,
     rng: DefaultRng,
 }
 
 impl EvalRouterState {
     fn select(&mut self, bucket: PromptBucket) -> Option<Selection> {
+        self.select_excluding(bucket, &[])
+    }
+
+    /// Pick the next candidate, excluding any model in `excluded`. Used by
+    /// the stream loop to cascade to a different model after a provider
+    /// error. Returns `None` if every candidate has already been tried.
+    fn select_excluding(&mut self, bucket: PromptBucket, excluded: &[String]) -> Option<Selection> {
+        let remaining: Vec<String> = self
+            .candidates
+            .iter()
+            .filter(|candidate| !excluded.iter().any(|tried| tried == *candidate))
+            .cloned()
+            .collect();
+        if remaining.is_empty() {
+            return None;
+        }
         match self.scoreboard.select(
             bucket,
-            &self.candidates,
+            &remaining,
             self.epsilon,
             self.min_samples,
             &mut self.rng,
@@ -7287,17 +7334,49 @@ impl EvalRouterState {
         input_tokens: u32,
         output_tokens: u32,
     ) {
-        self.scoreboard.record_outcome(
+        let cost_micros = cost_micros_for(model, input_tokens, output_tokens);
+        self.scoreboard.record_outcome_with_decay(
             bucket,
             model,
             success,
             latency_ms,
             input_tokens,
             output_tokens,
+            cost_micros,
+            self.half_life_ms,
         );
         if let Err(error) = self.scoreboard.save() {
             eprintln!("warning: failed to persist router scoreboard: {error}");
         }
+    }
+}
+
+/// Compute the provider cost for a single turn in micro-dollars
+/// (10⁻⁶ USD). Returns 0 when `pricing_for_model` has no entry for the
+/// model family — unknown pricing is better than wrong pricing. Cost
+/// accumulates across turns inside `ModelStats::total_cost_micros` for
+/// the per-model ledger exposed via `claw eval` and the scoreboard file.
+fn cost_micros_for(model: &str, input_tokens: u32, output_tokens: u32) -> u64 {
+    let Some(pricing) = runtime::pricing_for_model(model) else {
+        return 0;
+    };
+    // Pricing is per million tokens in dollars. Tokens * cost is
+    // micro-dollars (because dollars * 1e6 / 1e6 = dollars, but tokens
+    // are counts not ratios — multiplying tokens by per-million-dollar
+    // price yields micro-dollars directly).
+    let input_micros = f64::from(input_tokens) * pricing.input_cost_per_million;
+    let output_micros = f64::from(output_tokens) * pricing.output_cost_per_million;
+    let total = (input_micros + output_micros).round();
+    if total <= 0.0 {
+        0
+    } else {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let as_u64 = total as u64;
+        as_u64
     }
 }
 
@@ -7454,6 +7533,13 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
+/// Maximum number of candidate models tried per turn when the
+/// eval-driven router is configured. First attempt uses the scoreboard's
+/// native select; each subsequent attempt calls `select_excluding` with
+/// every model already tried this turn so one failing provider can't
+/// take down a turn another candidate would have handled.
+const MAX_ROUTER_ATTEMPTS: usize = 2;
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -7461,92 +7547,136 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let bucket = prompt_bucket_for_request(&request);
+        let converted_messages = convert_messages(&request.messages);
+        let system_prompt =
+            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let tools = self
+            .enable_tools
+            .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref()));
 
-        // If the eval-driven router is active, consult its scoreboard
-        // *before* we build the outgoing request so we can override the
-        // model string. We remember `(bucket, selected_model)` so we can
-        // attribute the outcome back to the right row after the stream
-        // completes.
-        let routed: Option<(PromptBucket, String)> = if let Some(router) = self.eval_router.as_mut()
-        {
-            let bucket = prompt_bucket_for_request(&request);
-            match router.select(bucket) {
-                Some(selection) => {
+        let mut tried: Vec<String> = Vec::new();
+        let mut final_outcome: Result<Vec<AssistantEvent>, RuntimeError> =
+            Err(RuntimeError::new("router selected no model"));
+
+        for attempt in 0..MAX_ROUTER_ATTEMPTS {
+            // Pick the model for this attempt. Attempt 0 uses the
+            // scoreboard's default select; later attempts exclude every
+            // model we've already tried this turn.
+            let selection: Option<Selection> = if let Some(router) = self.eval_router.as_mut() {
+                if attempt == 0 {
+                    router.select(bucket)
+                } else {
+                    router.select_excluding(bucket, &tried)
+                }
+            } else {
+                None
+            };
+
+            let effective_model = if let Some(s) = selection.as_ref() {
+                if attempt == 0 {
                     eprintln!(
                         "[router] bucket={} selected={} reason={}",
-                        selection.bucket, selection.model, selection.reason
+                        s.bucket, s.model, s.reason
                     );
-                    Some((selection.bucket, selection.model))
+                } else {
+                    eprintln!(
+                        "[router] bucket={} fallback={} reason={} after={:?}",
+                        s.bucket, s.model, s.reason, tried
+                    );
                 }
-                None => None,
-            }
-        } else {
-            None
-        };
-        let effective_model = routed
-            .as_ref()
-            .map_or_else(|| self.model.clone(), |(_, model)| model.clone());
+                s.model.clone()
+            } else {
+                // No router, or router exhausted candidates — fall back
+                // to the fixed model wired into this client. After the
+                // first attempt there's nothing new to try, so stop.
+                if attempt > 0 {
+                    break;
+                }
+                self.model.clone()
+            };
+            tried.push(effective_model.clone());
 
-        let message_request = MessageRequest {
-            model: effective_model.clone(),
-            max_tokens: max_tokens_for_model(&effective_model),
-            messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
-            stream: true,
-            reasoning_effort: self.reasoning_effort.clone(),
-            ..Default::default()
-        };
+            let message_request = MessageRequest {
+                model: effective_model.clone(),
+                max_tokens: max_tokens_for_model(&effective_model),
+                messages: converted_messages.clone(),
+                system: system_prompt.clone(),
+                tools: tools.clone(),
+                tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+                stream: true,
+                reasoning_effort: self.reasoning_effort.clone(),
+                ..Default::default()
+            };
 
-        let started = Instant::now();
-        let outcome = self.runtime.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+            let started = Instant::now();
+            let outcome = self.runtime.block_on(async {
+                // When resuming after tool execution, apply a stall
+                // timeout on the first stream event. If the model does
+                // not respond within the deadline we drop the stalled
+                // connection and re-send the request as a continuation
+                // nudge (one retry only).
+                let max_stream_attempts: usize = if is_post_tool { 2 } else { 1 };
 
-            for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
-                    Ok(events) => return Ok(events),
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion — nudge the model by
-                        // re-sending the same request.
+                for stream_attempt in 1..=max_stream_attempts {
+                    let result = self
+                        .consume_stream(&message_request, is_post_tool && stream_attempt == 1)
+                        .await;
+                    match result {
+                        Ok(events) => return Ok(events),
+                        Err(error)
+                            if error.to_string().contains("post-tool stall")
+                                && stream_attempt < max_stream_attempts =>
+                        {
+                            // Stalled after tool completion — nudge the
+                            // model by re-sending the same request.
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
+                }
+
+                Err(RuntimeError::new("post-tool continuation nudge exhausted"))
+            });
+            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            match outcome {
+                Ok(events) => {
+                    if let Some(router) = self.eval_router.as_mut() {
+                        let (input_tokens, output_tokens) = tokens_from_events(&events);
+                        router.record(
+                            bucket,
+                            &effective_model,
+                            true,
+                            latency_ms,
+                            input_tokens,
+                            output_tokens,
+                        );
+                    }
+                    return Ok(events);
+                }
+                Err(error) => {
+                    if let Some(router) = self.eval_router.as_mut() {
+                        router.record(bucket, &effective_model, false, latency_ms, 0, 0);
+                    }
+                    let can_fallback = self.eval_router.is_some()
+                        && attempt + 1 < MAX_ROUTER_ATTEMPTS
+                        && self
+                            .eval_router
+                            .as_ref()
+                            .is_some_and(|r| r.candidates.len() > tried.len());
+                    if can_fallback {
+                        eprintln!(
+                            "[router] {effective_model} failed ({error}); cascading to next candidate"
+                        );
+                        final_outcome = Err(error);
+                        continue;
+                    }
+                    return Err(error);
                 }
             }
-
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
-        });
-
-        if let (Some(router), Some((bucket, model))) = (self.eval_router.as_mut(), routed.as_ref())
-        {
-            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let success = outcome.is_ok();
-            let (input_tokens, output_tokens) = outcome
-                .as_ref()
-                .map_or((0, 0), |events| tokens_from_events(events));
-            router.record(
-                *bucket,
-                model,
-                success,
-                latency_ms,
-                input_tokens,
-                output_tokens,
-            );
         }
 
-        outcome
+        final_outcome
     }
 }
 
@@ -9029,8 +9159,8 @@ mod tests {
         STUB_COMMANDS,
     };
     use super::{
-        flatten_user_text, parse_eval_args, prompt_bucket_for_request, tokens_from_events,
-        truncate_for_log, EvalSummary,
+        cost_micros_for, flatten_user_text, parse_eval_args, prompt_bucket_for_request,
+        tokens_from_events, truncate_for_log, EvalSummary,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -12450,6 +12580,39 @@ UU conflicted.rs",
         assert!(rendered.contains("ok=0"));
         assert!(rendered.contains("failed=2"));
         assert!(rendered.contains("avg_latency_ms=0"));
+    }
+
+    #[test]
+    fn eval_summary_accumulates_cost_using_pricing_for_model() {
+        let mut summary = EvalSummary::default();
+        // Haiku at $1/M input, $5/M output: 10_000 in + 2_000 out =
+        // 10_000 + 10_000 = 20_000 micro-dollars = $0.02.
+        summary.record_success("claude-haiku-4-5", 100, 10_000, 2_000);
+        // Opus at $15/M input, $75/M output: 1_000 in + 500 out =
+        // 15_000 + 37_500 = 52_500 micro-dollars = $0.0525.
+        summary.record_success("claude-opus-4-6", 400, 1_000, 500);
+        let expected_micros: u64 = 20_000 + 52_500;
+        assert_eq!(summary.total_cost_micros, expected_micros);
+        #[allow(clippy::cast_precision_loss)]
+        let expected_usd = (expected_micros as f64) / 1_000_000.0;
+        assert!((summary.total_cost_usd() - expected_usd).abs() < 1e-9);
+        let rendered = summary.render();
+        assert!(
+            rendered.contains("cost=$"),
+            "render should include cost: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cost_micros_for_returns_zero_for_unknown_models() {
+        assert_eq!(cost_micros_for("random-model", 1_000, 1_000), 0);
+    }
+
+    #[test]
+    fn cost_micros_for_uses_haiku_pricing() {
+        // $1/M input + $5/M output on 1_000_000 in / 1_000_000 out = $6.
+        let cost = cost_micros_for("claude-haiku-4-5", 1_000_000, 1_000_000);
+        assert_eq!(cost, 6_000_000);
     }
 
     #[test]

@@ -305,6 +305,10 @@ const ROUTER_FIELDS: &[FieldSpec] = &[
         name: "scoreboardPath",
         expected: FieldType::String,
     },
+    FieldSpec {
+        name: "halfLifeHours",
+        expected: FieldType::Number,
+    },
 ];
 
 const MEMORY_FIELDS: &[FieldSpec] = &[
