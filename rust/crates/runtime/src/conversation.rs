@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
+use memory_client::{MemoryClient, MemoryMessage, MemoryRole};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
@@ -12,8 +13,10 @@ use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRun
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
-use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::usage::{TokenUsage, UsageTracker};
+
+const DEFAULT_MEMORY_RECALL_LIMIT: usize = 5;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
@@ -136,6 +139,8 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    memory_client: Option<Box<dyn MemoryClient>>,
+    memory_recall_limit: usize,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -185,7 +190,22 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            memory_client: None,
+            memory_recall_limit: DEFAULT_MEMORY_RECALL_LIMIT,
         }
+    }
+
+    #[must_use]
+    pub fn with_memory_client(
+        mut self,
+        memory_client: Box<dyn MemoryClient>,
+        recall_limit: usize,
+    ) -> Self {
+        self.memory_client = Some(memory_client);
+        if recall_limit > 0 {
+            self.memory_recall_limit = recall_limit;
+        }
+        self
     }
 
     #[must_use]
@@ -330,9 +350,12 @@ where
         }
 
         self.record_turn_started(&user_input);
+        let turn_user_input = user_input.clone();
         self.session
             .push_user_text(user_input)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+
+        let effective_system_prompt = self.system_prompt_with_memory(&turn_user_input);
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -350,7 +373,7 @@ where
             }
 
             let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
+                system_prompt: effective_system_prompt.clone(),
                 messages: self.session.messages.clone(),
             };
             let events = match self.api_client.stream(request) {
@@ -499,6 +522,8 @@ where
             }
         }
 
+        self.ingest_turn_to_memory(&turn_user_input, &assistant_messages);
+
         let auto_compaction = self.maybe_auto_compact();
 
         let summary = TurnSummary {
@@ -512,6 +537,56 @@ where
         self.record_turn_completed(&summary);
 
         Ok(summary)
+    }
+
+    fn system_prompt_with_memory(&mut self, user_input: &str) -> Vec<String> {
+        let mut prompt = self.system_prompt.clone();
+        let Some(client) = self.memory_client.as_mut() else {
+            return prompt;
+        };
+        let session_id = self.session.session_id.clone();
+        match client.recall(&session_id, user_input, self.memory_recall_limit) {
+            Ok(snippets) if !snippets.is_empty() => {
+                let mut block = String::from("Relevant memories from previous sessions:\n");
+                for snippet in snippets {
+                    block.push_str("- ");
+                    block.push_str(snippet.trim());
+                    block.push('\n');
+                }
+                prompt.push(block);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("warning: memory recall failed: {error}");
+            }
+        }
+        prompt
+    }
+
+    fn ingest_turn_to_memory(
+        &mut self,
+        user_input: &str,
+        assistant_messages: &[ConversationMessage],
+    ) {
+        let Some(client) = self.memory_client.as_mut() else {
+            return;
+        };
+        let mut payload = Vec::new();
+        payload.push(MemoryMessage::new(MemoryRole::User, user_input));
+        for message in assistant_messages {
+            if let Some(text) = flatten_assistant_text(message) {
+                if !text.is_empty() {
+                    payload.push(MemoryMessage::new(MemoryRole::Assistant, text));
+                }
+            }
+        }
+        if payload.len() <= 1 {
+            return;
+        }
+        let session_id = self.session.session_id.clone();
+        if let Err(error) = client.ingest(&session_id, &payload) {
+            eprintln!("warning: memory ingest failed: {error}");
+        }
     }
 
     #[must_use]
@@ -701,6 +776,26 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+fn flatten_assistant_text(message: &ConversationMessage) -> Option<String> {
+    if message.role != MessageRole::Assistant {
+        return None;
+    }
+    let mut combined = String::new();
+    for block in &message.blocks {
+        if let ContentBlock::Text { text } = block {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(text);
+        }
+    }
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
 }
 
 fn build_assistant_message(
@@ -1807,5 +1902,158 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn run_turn_injects_recalled_memory_and_ingests_assistant_reply() {
+        use memory_client::{MemoryClient, MemoryError, MemoryMessage, MemoryRole};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingMemory {
+            recalled: Vec<String>,
+            ingested: Vec<(String, Vec<MemoryMessage>)>,
+        }
+
+        struct MemoryProbe {
+            state: Arc<Mutex<RecordingMemory>>,
+            recall_response: Vec<String>,
+        }
+
+        impl MemoryClient for MemoryProbe {
+            fn recall(
+                &mut self,
+                _session_id: &str,
+                query: &str,
+                _limit: usize,
+            ) -> Result<Vec<String>, MemoryError> {
+                self.state.lock().unwrap().recalled.push(query.to_string());
+                Ok(self.recall_response.clone())
+            }
+
+            fn ingest(
+                &mut self,
+                session_id: &str,
+                messages: &[MemoryMessage],
+            ) -> Result<(), MemoryError> {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .ingested
+                    .push((session_id.to_string(), messages.to_vec()));
+                Ok(())
+            }
+        }
+
+        struct PromptCapturingApi {
+            captured: Arc<Mutex<Option<Vec<String>>>>,
+        }
+
+        impl ApiClient for PromptCapturingApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                *self.captured.lock().unwrap() = Some(request.system_prompt);
+                Ok(vec![
+                    AssistantEvent::TextDelta("noted".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let state = Arc::new(Mutex::new(RecordingMemory::default()));
+        let captured_prompt: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+        let probe = MemoryProbe {
+            state: Arc::clone(&state),
+            recall_response: vec!["User prefers Rust".to_string()],
+        };
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            PromptCapturingApi {
+                captured: Arc::clone(&captured_prompt),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["base system prompt".to_string()],
+        )
+        .with_memory_client(Box::new(probe), 4);
+
+        let summary = runtime
+            .run_turn("what language should I use?", None)
+            .expect("turn completes");
+        assert_eq!(summary.assistant_messages.len(), 1);
+
+        let sent_prompt = captured_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("api client sees the augmented prompt");
+        assert_eq!(sent_prompt.len(), 2);
+        assert_eq!(sent_prompt[0], "base system prompt");
+        assert!(sent_prompt[1].contains("User prefers Rust"));
+        assert!(sent_prompt[1].contains("Relevant memories"));
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.recalled,
+            vec!["what language should I use?".to_string()]
+        );
+        assert_eq!(state.ingested.len(), 1);
+        let (_, messages) = &state.ingested[0];
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MemoryRole::User);
+        assert_eq!(messages[0].content, "what language should I use?");
+        assert_eq!(messages[1].role, MemoryRole::Assistant);
+        assert_eq!(messages[1].content, "noted");
+    }
+
+    #[test]
+    fn run_turn_tolerates_memory_failures() {
+        use memory_client::{MemoryClient, MemoryError, MemoryMessage};
+
+        struct BrokenMemory;
+        impl MemoryClient for BrokenMemory {
+            fn recall(
+                &mut self,
+                _session_id: &str,
+                _query: &str,
+                _limit: usize,
+            ) -> Result<Vec<String>, MemoryError> {
+                Err(MemoryError::Network("sidecar down".into()))
+            }
+            fn ingest(
+                &mut self,
+                _session_id: &str,
+                _messages: &[MemoryMessage],
+            ) -> Result<(), MemoryError> {
+                Err(MemoryError::Network("sidecar down".into()))
+            }
+        }
+
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_memory_client(Box::new(BrokenMemory), 3);
+
+        let summary = runtime
+            .run_turn("hello", None)
+            .expect("memory failures must not abort the turn");
+        assert_eq!(summary.assistant_messages.len(), 1);
     }
 }

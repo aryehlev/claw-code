@@ -197,6 +197,14 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "trustedRoots",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "memory",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "router",
+        expected: FieldType::Object,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -256,6 +264,72 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "maxOutputTokens",
+        expected: FieldType::Number,
+    },
+];
+
+const ROUTER_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "mode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "baseUrl",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "apiKey",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "model",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "candidates",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "epsilonPercent",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "minSamples",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "scoreboardPath",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "halfLifeHours",
+        expected: FieldType::Number,
+    },
+];
+
+const MEMORY_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "baseUrl",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "apiKey",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "userId",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "recallLimit",
         expected: FieldType::Number,
     },
 ];
@@ -497,6 +571,24 @@ pub fn validate_config_file(
             oauth,
             OAUTH_FIELDS,
             "oauth",
+            source,
+            &path_display,
+        ));
+    }
+    if let Some(memory) = object.get("memory").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            memory,
+            MEMORY_FIELDS,
+            "memory",
+            source,
+            &path_display,
+        ));
+    }
+    if let Some(router) = object.get("router").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            router,
+            ROUTER_FIELDS,
+            "router",
             source,
             &path_display,
         ));

@@ -10,7 +10,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -26,9 +26,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
+use eval_router::{DefaultRng, PromptBucket, RouterScoreboard, Selection};
 
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -179,6 +181,7 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -258,6 +261,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_path,
             output_format,
         } => run_export(&session_reference, output_path.as_deref(), output_format)?,
+        CliAction::Eval {
+            session_reference,
+            output_path,
+            output_format,
+            max_turns,
+        } => run_eval_command(
+            &session_reference,
+            output_path.as_deref(),
+            output_format,
+            max_turns,
+        )?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -353,6 +367,16 @@ enum CliAction {
         session_reference: String,
         output_path: Option<PathBuf>,
         output_format: CliOutputFormat,
+    },
+    /// Replay a recorded session's user turns through the configured router
+    /// (`.claw.json` `router` block) and emit one JSONL record per turn
+    /// capturing which upstream model the router picked, latency, and
+    /// token usage. Writes to stdout or to `output_path` if provided.
+    Eval {
+        session_reference: String,
+        output_path: Option<PathBuf>,
+        output_format: CliOutputFormat,
+        max_turns: Option<usize>,
     },
     Repl {
         model: String,
@@ -679,6 +703,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
+        "eval" => parse_eval_args(&rest[1..], output_format),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -1299,6 +1324,72 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
         session_reference,
         output_path,
         output_format,
+    })
+}
+
+fn parse_eval_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
+    let mut output_path: Option<PathBuf> = None;
+    let mut max_turns: Option<usize> = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--session" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --session".to_string())?;
+                session_reference.clone_from(value);
+                index += 2;
+            }
+            flag if flag.starts_with("--session=") => {
+                session_reference = flag[10..].to_string();
+                index += 1;
+            }
+            "--output" | "-o" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("missing value for {}", args[index]))?;
+                output_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            flag if flag.starts_with("--output=") => {
+                output_path = Some(PathBuf::from(&flag[9..]));
+                index += 1;
+            }
+            "--max-turns" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --max-turns".to_string())?;
+                max_turns = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid value for --max-turns: {value}"))?,
+                );
+                index += 2;
+            }
+            flag if flag.starts_with("--max-turns=") => {
+                let raw = &flag[12..];
+                max_turns = Some(
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("invalid value for --max-turns: {raw}"))?,
+                );
+                index += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown eval option: {other}"));
+            }
+            other => {
+                return Err(format!("unexpected eval argument: {other}"));
+            }
+        }
+    }
+
+    Ok(CliAction::Eval {
+        session_reference,
+        output_path,
+        output_format,
+        max_turns,
     })
 }
 
@@ -6134,6 +6225,231 @@ fn run_export(
     Ok(())
 }
 
+/// Accumulated metrics for an eval run. Surfaced as a one-line summary on
+/// stderr after the JSONL stream finishes so pipelines can redirect stdout
+/// to a file and still see the overview.
+#[derive(Debug, Default)]
+struct EvalSummary {
+    total_turns: usize,
+    successful_turns: usize,
+    failures: usize,
+    total_latency_ms: u64,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    /// Cumulative provider cost in micro-dollars across every successful
+    /// turn in this eval run.
+    total_cost_micros: u64,
+    model_counts: BTreeMap<String, usize>,
+}
+
+impl EvalSummary {
+    fn record_success(
+        &mut self,
+        model: &str,
+        latency_ms: u64,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) {
+        self.total_turns += 1;
+        self.successful_turns += 1;
+        self.total_latency_ms += latency_ms;
+        self.total_input_tokens += u64::from(input_tokens);
+        self.total_output_tokens += u64::from(output_tokens);
+        self.total_cost_micros = self.total_cost_micros.saturating_add(cost_micros_for(
+            model,
+            input_tokens,
+            output_tokens,
+        ));
+        *self.model_counts.entry(model.to_string()).or_insert(0) += 1;
+    }
+
+    fn record_failure(&mut self) {
+        self.total_turns += 1;
+        self.failures += 1;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn total_cost_usd(&self) -> f64 {
+        (self.total_cost_micros as f64) / 1_000_000.0
+    }
+
+    fn render(&self) -> String {
+        let avg_latency = if self.successful_turns == 0 {
+            0
+        } else {
+            self.total_latency_ms / self.successful_turns as u64
+        };
+        let mut parts = vec![
+            format!("turns={}", self.total_turns),
+            format!("ok={}", self.successful_turns),
+            format!("failed={}", self.failures),
+            format!("avg_latency_ms={avg_latency}"),
+            format!(
+                "tokens_in={} tokens_out={}",
+                self.total_input_tokens, self.total_output_tokens
+            ),
+            format!("cost=${:.4}", self.total_cost_usd()),
+        ];
+        if !self.model_counts.is_empty() {
+            let mut pairs: Vec<String> = self
+                .model_counts
+                .iter()
+                .map(|(model, count)| format!("{model}={count}"))
+                .collect();
+            pairs.sort();
+            parts.push(format!("models[{}]", pairs.join(",")));
+        }
+        format!("[eval] {}", parts.join(" "))
+    }
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max_chars).collect();
+    out.push_str("...");
+    out
+}
+
+fn flatten_user_text(message: &ConversationMessage) -> String {
+    let mut combined = String::new();
+    for block in &message.blocks {
+        if let ContentBlock::Text { text } = block {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(text);
+        }
+    }
+    combined
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_eval_command(
+    session_reference: &str,
+    output_path: Option<&Path>,
+    output_format: CliOutputFormat,
+    max_turns: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let router_config = runtime_config.router();
+    let router = build_router_override(router_config).ok_or_else(|| {
+        "eval requires `router.enabled: true` with `router.baseUrl` and `router.model` set in .claw.json"
+            .to_string()
+    })?;
+
+    let (handle, session) = load_session_reference(session_reference)?;
+
+    // Collect user turns along with the cumulative history each one needs so
+    // the router's decision reflects actual conversation depth.
+    let mut plans: Vec<(usize, Vec<ConversationMessage>, String)> = Vec::new();
+    for (index, message) in session.messages.iter().enumerate() {
+        if message.role != MessageRole::User {
+            continue;
+        }
+        let text = flatten_user_text(message);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let history = session.messages[..=index].to_vec();
+        plans.push((index, history, text));
+    }
+
+    if let Some(limit) = max_turns {
+        plans.truncate(limit);
+    }
+
+    let client = OpenAiCompatClient::new(router.api_key.clone(), OpenAiCompatConfig::openai())
+        .with_base_url(router.base_url.clone());
+
+    let tokio_rt = tokio::runtime::Runtime::new()?;
+
+    let mut writer: Box<dyn Write> = match output_path {
+        Some(path) => Box::new(fs::File::create(path)?),
+        None => Box::new(io::stdout()),
+    };
+
+    let mut summary = EvalSummary::default();
+
+    for (turn_index, history, user_text) in plans {
+        let request = MessageRequest {
+            model: router.model.clone(),
+            max_tokens: max_tokens_for_model(&router.model),
+            messages: convert_messages(&history),
+            stream: false,
+            ..Default::default()
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = tokio_rt.block_on(async { client.send_message(&request).await });
+        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        let record = match outcome {
+            Ok(response) => {
+                let input_tokens = response.usage.input_tokens;
+                let output_tokens = response.usage.output_tokens;
+                let cost_micros = cost_micros_for(&response.model, input_tokens, output_tokens);
+                summary.record_success(&response.model, latency_ms, input_tokens, output_tokens);
+                json!({
+                    "turn_index": turn_index,
+                    "user_input": truncate_for_log(&user_text, 200),
+                    "requested_model": router.model,
+                    "routed_model": response.model,
+                    "latency_ms": latency_ms,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cost_micros": cost_micros,
+                    "ok": true,
+                })
+            }
+            Err(error) => {
+                summary.record_failure();
+                json!({
+                    "turn_index": turn_index,
+                    "user_input": truncate_for_log(&user_text, 200),
+                    "requested_model": router.model,
+                    "latency_ms": latency_ms,
+                    "ok": false,
+                    "error": error.to_string(),
+                })
+            }
+        };
+
+        writeln!(writer, "{}", serde_json::to_string(&record)?)?;
+    }
+
+    writer.flush()?;
+
+    let summary_line = summary.render();
+    eprintln!("{summary_line}");
+
+    if matches!(output_format, CliOutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "eval",
+                "session_id": handle.id,
+                "session_path": handle.path.display().to_string(),
+                "total_turns": summary.total_turns,
+                "successful_turns": summary.successful_turns,
+                "failures": summary.failures,
+                "total_latency_ms": summary.total_latency_ms,
+                "total_input_tokens": summary.total_input_tokens,
+                "total_output_tokens": summary.total_output_tokens,
+                "total_cost_micros": summary.total_cost_micros,
+                "total_cost_usd": summary.total_cost_usd(),
+                "models": summary.model_counts,
+            }))?
+        );
+    }
+
+    Ok(())
+}
+
 fn render_session_markdown(session: &Session, session_id: &str, session_path: &Path) -> String {
     let mut lines = vec![
         "# Conversation Export".to_string(),
@@ -6700,6 +7016,8 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let router_override = build_router_override(feature_config.router());
+    let eval_router = build_eval_router(feature_config.router());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -6710,6 +7028,8 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            router_override,
+            eval_router,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -6724,7 +7044,139 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
+    if let Some((memory_client, recall_limit)) = build_memory_client(feature_config.memory()) {
+        runtime = runtime.with_memory_client(memory_client, recall_limit);
+    }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+}
+
+fn build_router_override(config: &runtime::RouterConfig) -> Option<RouterOverride> {
+    if !config.enabled() || config.mode() != runtime::RouterMode::External {
+        return None;
+    }
+    let Some(base_url) = config.base_url() else {
+        eprintln!("warning: router.enabled is true but router.baseUrl is unset; skipping");
+        return None;
+    };
+    let Some(model) = config.model() else {
+        eprintln!("warning: router.enabled is true but router.model is unset; skipping");
+        return None;
+    };
+    // Most OpenAI-compat proxies (GPTCache, RouteLLM, LiteLLM) accept an
+    // empty bearer token when they handle upstream credentials themselves.
+    // We still send *something* because `OpenAiCompatClient` always emits an
+    // `Authorization` header.
+    let api_key = config.api_key().unwrap_or("sk-router").to_string();
+    Some(RouterOverride {
+        base_url: base_url.to_string(),
+        api_key,
+        model: model.to_string(),
+    })
+}
+
+/// Default scoreboard location when `router.scoreboardPath` is unset.
+/// Mirrors the session store's per-user data dir so multiple workspaces
+/// share one scoreboard unless the user overrides it.
+fn default_scoreboard_path() -> Option<PathBuf> {
+    env::var_os("XDG_DATA_HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join("claw")
+                .join("router-scoreboard.json")
+        })
+        .or_else(|| {
+            env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join("claw")
+                    .join("router-scoreboard.json")
+            })
+        })
+}
+
+fn build_eval_router(config: &runtime::RouterConfig) -> Option<EvalRouterState> {
+    if !config.enabled() || config.mode() != runtime::RouterMode::EvalDriven {
+        return None;
+    }
+    if config.candidates().is_empty() {
+        eprintln!(
+            "warning: router.mode=eval-driven requires router.candidates with at least one model; skipping"
+        );
+        return None;
+    }
+    let scoreboard_path = config
+        .scoreboard_path()
+        .map(PathBuf::from)
+        .or_else(default_scoreboard_path);
+    let Some(scoreboard_path) = scoreboard_path else {
+        eprintln!(
+            "warning: router.mode=eval-driven requires router.scoreboardPath when HOME/XDG_DATA_HOME are unset; skipping"
+        );
+        return None;
+    };
+    let scoreboard = match RouterScoreboard::load(&scoreboard_path) {
+        Ok(board) => board,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to load router scoreboard at {}: {error}; starting empty",
+                scoreboard_path.display()
+            );
+            RouterScoreboard::in_memory()
+        }
+    };
+    let epsilon = config.epsilon().unwrap_or(0.1).clamp(0.0, 1.0);
+    let min_samples = config.min_samples().unwrap_or(5);
+    // Default half-life: one week. Users get sensible forgetting out of
+    // the box; opt out by setting `router.halfLifeHours: 0` in
+    // .claw.json (0 disables decay).
+    let half_life_ms = match config.half_life_hours() {
+        Some(0) => None,
+        Some(hours) => Some(u64::from(hours).saturating_mul(3_600_000)),
+        None => Some(168_u64.saturating_mul(3_600_000)),
+    };
+    Some(EvalRouterState {
+        scoreboard,
+        candidates: config.candidates().to_vec(),
+        epsilon,
+        min_samples,
+        half_life_ms,
+        rng: DefaultRng::from_system_time(),
+    })
+}
+
+fn build_memory_client(
+    config: &runtime::MemoryConfig,
+) -> Option<(Box<dyn memory_client::MemoryClient>, usize)> {
+    if !config.enabled() {
+        return None;
+    }
+    let Some(base_url) = config.base_url() else {
+        eprintln!("warning: memory.enabled is true but memory.baseUrl is unset; skipping");
+        return None;
+    };
+    let Some(user_id) = config.user_id() else {
+        eprintln!("warning: memory.enabled is true but memory.userId is unset; skipping");
+        return None;
+    };
+    let mut zep_config = memory_client::ZepConfig::new(base_url, user_id);
+    if let Some(api_key) = config.api_key() {
+        zep_config = zep_config.with_api_key(api_key);
+    }
+    match memory_client::ZepMemoryClient::new(zep_config) {
+        Ok(client) => {
+            let recall_limit = config
+                .recall_limit()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(5);
+            Some((Box::new(client), recall_limit))
+        }
+        Err(error) => {
+            eprintln!("warning: failed to construct memory client: {error}");
+            None
+        }
+    }
 }
 
 struct CliHookProgressReporter;
@@ -6815,11 +7267,164 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 // `detect_provider_kind(&model)`. The struct name is kept to avoid
 // churning `BuiltRuntime` and every Deref/DerefMut site that references
 // it. See ROADMAP #29 for the provider-dispatch routing fix.
+/// Configured routing proxy (e.g. `GPTCache` fronting `RouteLLM`) that
+/// short-circuits per-model provider detection. Built from
+/// [`runtime::RouterConfig`] at CLI boot.
+#[derive(Debug, Clone)]
+struct RouterOverride {
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+/// Eval-driven in-process router state. Lives on `AnthropicRuntimeClient`
+/// so `ApiClient::stream` can consult the scoreboard per turn and record
+/// the outcome after the stream completes.
+struct EvalRouterState {
+    scoreboard: RouterScoreboard,
+    candidates: Vec<String>,
+    epsilon: f64,
+    min_samples: u32,
+    /// Scoreboard decay half-life in milliseconds. `None` = no decay
+    /// (append-forever, the pre-decay behavior). Set from
+    /// `router.halfLifeHours` in `.claw.json`.
+    half_life_ms: Option<u64>,
+    rng: DefaultRng,
+}
+
+impl EvalRouterState {
+    fn select(&mut self, bucket: PromptBucket) -> Option<Selection> {
+        self.select_excluding(bucket, &[])
+    }
+
+    /// Pick the next candidate, excluding any model in `excluded`. Used by
+    /// the stream loop to cascade to a different model after a provider
+    /// error. Returns `None` if every candidate has already been tried.
+    fn select_excluding(&mut self, bucket: PromptBucket, excluded: &[String]) -> Option<Selection> {
+        let remaining: Vec<String> = self
+            .candidates
+            .iter()
+            .filter(|candidate| !excluded.iter().any(|tried| tried == *candidate))
+            .cloned()
+            .collect();
+        if remaining.is_empty() {
+            return None;
+        }
+        match self.scoreboard.select(
+            bucket,
+            &remaining,
+            self.epsilon,
+            self.min_samples,
+            &mut self.rng,
+        ) {
+            Ok(selection) => Some(selection),
+            Err(error) => {
+                eprintln!("warning: eval router selection failed: {error}");
+                None
+            }
+        }
+    }
+
+    fn record(
+        &mut self,
+        bucket: PromptBucket,
+        model: &str,
+        success: bool,
+        latency_ms: u64,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) {
+        let cost_micros = cost_micros_for(model, input_tokens, output_tokens);
+        self.scoreboard.record_outcome_with_decay(
+            bucket,
+            model,
+            success,
+            latency_ms,
+            input_tokens,
+            output_tokens,
+            cost_micros,
+            self.half_life_ms,
+        );
+        if let Err(error) = self.scoreboard.save() {
+            eprintln!("warning: failed to persist router scoreboard: {error}");
+        }
+    }
+}
+
+/// Compute the provider cost for a single turn in micro-dollars
+/// (10⁻⁶ USD). Returns 0 when `pricing_for_model` has no entry for the
+/// model family — unknown pricing is better than wrong pricing. Cost
+/// accumulates across turns inside `ModelStats::total_cost_micros` for
+/// the per-model ledger exposed via `claw eval` and the scoreboard file.
+fn cost_micros_for(model: &str, input_tokens: u32, output_tokens: u32) -> u64 {
+    let Some(pricing) = runtime::pricing_for_model(model) else {
+        return 0;
+    };
+    // Pricing is per million tokens in dollars. Tokens * cost is
+    // micro-dollars (because dollars * 1e6 / 1e6 = dollars, but tokens
+    // are counts not ratios — multiplying tokens by per-million-dollar
+    // price yields micro-dollars directly).
+    let input_micros = f64::from(input_tokens) * pricing.input_cost_per_million;
+    let output_micros = f64::from(output_tokens) * pricing.output_cost_per_million;
+    let total = (input_micros + output_micros).round();
+    if total <= 0.0 {
+        0
+    } else {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let as_u64 = total as u64;
+        as_u64
+    }
+}
+
+/// Length of the latest user message in characters — that's what bucketing
+/// keys off. If the latest message is not from the user we fall back to
+/// the total user-text length so a tool-result continuation still gets a
+/// stable bucket.
+fn prompt_bucket_for_request(request: &ApiRequest) -> PromptBucket {
+    use runtime::MessageRole as RtRole;
+    let latest_user_len = request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == RtRole::User)
+        .map_or(0, |message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    runtime::ContentBlock::Text { text } => Some(text.chars().count()),
+                    _ => None,
+                })
+                .sum::<usize>()
+        });
+    PromptBucket::from_prompt_chars(latest_user_len)
+}
+
+/// Extract the cumulative input/output token counts from the last
+/// [`AssistantEvent::Usage`] emitted during a turn, if any.
+fn tokens_from_events(events: &[AssistantEvent]) -> (u32, u32) {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AssistantEvent::Usage(usage) => Some((usage.input_tokens, usage.output_tokens)),
+            _ => None,
+        })
+        .unwrap_or((0, 0))
+}
+
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
     session_id: String,
     model: String,
+    user_model: String,
+    router_enabled: bool,
+    eval_router: Option<EvalRouterState>,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -6829,6 +7434,7 @@ struct AnthropicRuntimeClient {
 }
 
 impl AnthropicRuntimeClient {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_id: &str,
         model: String,
@@ -6837,6 +7443,8 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        router: Option<RouterOverride>,
+        eval_router: Option<EvalRouterState>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
@@ -6857,34 +7465,52 @@ impl AnthropicRuntimeClient {
         // session-scoped prompt cache on the Anthropic path; the
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
-        let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-            }
+        let user_model = model.clone();
+        let (client, effective_model) = if let Some(router) = router {
+            // Router override: all requests go to the configured proxy
+            // (GPTCache / RouteLLM / LiteLLM / etc.) under the OpenAI-compat
+            // wire protocol. The proxy is responsible for picking the
+            // actual upstream model; claw just hands it `router.model`
+            // (e.g. `router-mf-0.11593`) and observes the real model via
+            // the `MessageStart` event's `message.model` field.
+            let inner = OpenAiCompatClient::new(router.api_key, OpenAiCompatConfig::openai())
+                .with_base_url(router.base_url);
+            (ApiProviderClient::OpenAi(inner), router.model)
+        } else {
+            let resolved_model = api::resolve_model_alias(&model);
+            let client = match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => {
+                    let auth = resolve_cli_auth_source()?;
+                    let inner = AnthropicClient::from_auth(auth)
+                        .with_base_url(api::read_base_url())
+                        .with_prompt_cache(PromptCache::new(session_id));
+                    ApiProviderClient::Anthropic(inner)
+                }
+                ProviderKind::Xai | ProviderKind::OpenAi => {
+                    // The api crate's `ProviderClient::from_model_with_anthropic_auth`
+                    // with `None` for the anthropic auth routes via
+                    // `detect_provider_kind` and builds an
+                    // `OpenAiCompatClient::from_env` with the matching
+                    // `OpenAiCompatConfig` (openai / xai / dashscope).
+                    // That reads the correct API-key env var and BASE_URL
+                    // override internally, so this one call covers OpenAI,
+                    // OpenRouter, xAI, DashScope, Ollama, and any other
+                    // OpenAI-compat endpoint users configure via
+                    // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                }
+            };
+            (client, resolved_model)
         };
+        let router_enabled = user_model != effective_model || eval_router.is_some();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
-            model,
+            model: effective_model,
+            user_model,
+            router_enabled,
+            eval_router,
             enable_tools,
             emit_output,
             allowed_tools,
@@ -6907,6 +7533,13 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
+/// Maximum number of candidate models tried per turn when the
+/// eval-driven router is configured. First attempt uses the scoreboard's
+/// native select; each subsequent attempt calls `select_excluding` with
+/// every model already tried this turn so one failing provider can't
+/// take down a turn another candidate would have handled.
+const MAX_ROUTER_ATTEMPTS: usize = 2;
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -6914,46 +7547,136 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
-        let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
-            messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
-            stream: true,
-            reasoning_effort: self.reasoning_effort.clone(),
-            ..Default::default()
-        };
+        let bucket = prompt_bucket_for_request(&request);
+        let converted_messages = convert_messages(&request.messages);
+        let system_prompt =
+            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let tools = self
+            .enable_tools
+            .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref()));
 
-        self.runtime.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+        let mut tried: Vec<String> = Vec::new();
+        let mut final_outcome: Result<Vec<AssistantEvent>, RuntimeError> =
+            Err(RuntimeError::new("router selected no model"));
 
-            for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
-                    Ok(events) => return Ok(events),
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion — nudge the model by
-                        // re-sending the same request.
+        for attempt in 0..MAX_ROUTER_ATTEMPTS {
+            // Pick the model for this attempt. Attempt 0 uses the
+            // scoreboard's default select; later attempts exclude every
+            // model we've already tried this turn.
+            let selection: Option<Selection> = if let Some(router) = self.eval_router.as_mut() {
+                if attempt == 0 {
+                    router.select(bucket)
+                } else {
+                    router.select_excluding(bucket, &tried)
+                }
+            } else {
+                None
+            };
+
+            let effective_model = if let Some(s) = selection.as_ref() {
+                if attempt == 0 {
+                    eprintln!(
+                        "[router] bucket={} selected={} reason={}",
+                        s.bucket, s.model, s.reason
+                    );
+                } else {
+                    eprintln!(
+                        "[router] bucket={} fallback={} reason={} after={:?}",
+                        s.bucket, s.model, s.reason, tried
+                    );
+                }
+                s.model.clone()
+            } else {
+                // No router, or router exhausted candidates — fall back
+                // to the fixed model wired into this client. After the
+                // first attempt there's nothing new to try, so stop.
+                if attempt > 0 {
+                    break;
+                }
+                self.model.clone()
+            };
+            tried.push(effective_model.clone());
+
+            let message_request = MessageRequest {
+                model: effective_model.clone(),
+                max_tokens: max_tokens_for_model(&effective_model),
+                messages: converted_messages.clone(),
+                system: system_prompt.clone(),
+                tools: tools.clone(),
+                tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+                stream: true,
+                reasoning_effort: self.reasoning_effort.clone(),
+                ..Default::default()
+            };
+
+            let started = Instant::now();
+            let outcome = self.runtime.block_on(async {
+                // When resuming after tool execution, apply a stall
+                // timeout on the first stream event. If the model does
+                // not respond within the deadline we drop the stalled
+                // connection and re-send the request as a continuation
+                // nudge (one retry only).
+                let max_stream_attempts: usize = if is_post_tool { 2 } else { 1 };
+
+                for stream_attempt in 1..=max_stream_attempts {
+                    let result = self
+                        .consume_stream(&message_request, is_post_tool && stream_attempt == 1)
+                        .await;
+                    match result {
+                        Ok(events) => return Ok(events),
+                        Err(error)
+                            if error.to_string().contains("post-tool stall")
+                                && stream_attempt < max_stream_attempts =>
+                        {
+                            // Stalled after tool completion — nudge the
+                            // model by re-sending the same request.
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
+                }
+
+                Err(RuntimeError::new("post-tool continuation nudge exhausted"))
+            });
+            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            match outcome {
+                Ok(events) => {
+                    if let Some(router) = self.eval_router.as_mut() {
+                        let (input_tokens, output_tokens) = tokens_from_events(&events);
+                        router.record(
+                            bucket,
+                            &effective_model,
+                            true,
+                            latency_ms,
+                            input_tokens,
+                            output_tokens,
+                        );
+                    }
+                    return Ok(events);
+                }
+                Err(error) => {
+                    if let Some(router) = self.eval_router.as_mut() {
+                        router.record(bucket, &effective_model, false, latency_ms, 0, 0);
+                    }
+                    let can_fallback = self.eval_router.is_some()
+                        && attempt + 1 < MAX_ROUTER_ATTEMPTS
+                        && self
+                            .eval_router
+                            .as_ref()
+                            .is_some_and(|r| r.candidates.len() > tried.len());
+                    if can_fallback {
+                        eprintln!(
+                            "[router] {effective_model} failed ({error}); cascading to next candidate"
+                        );
+                        final_outcome = Err(error);
+                        continue;
+                    }
+                    return Err(error);
                 }
             }
+        }
 
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
-        })
+        final_outcome
     }
 }
 
@@ -7013,6 +7736,12 @@ impl AnthropicRuntimeClient {
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
+                    if self.router_enabled && !start.message.model.is_empty() {
+                        eprintln!(
+                            "[router] user_model={} routed_to={}",
+                            self.user_model, start.message.model
+                        );
+                    }
                     for block in start.message.content {
                         push_output_block(
                             block,
@@ -8428,6 +9157,10 @@ mod tests {
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
+    };
+    use super::{
+        cost_micros_for, flatten_user_text, parse_eval_args, prompt_bucket_for_request,
+        tokens_from_events, truncate_for_log, EvalSummary,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -11718,6 +12451,308 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    #[test]
+    fn parse_eval_args_defaults_to_latest_reference() {
+        let parsed = parse_eval_args(&[], CliOutputFormat::Text).expect("empty eval args parse");
+        assert_eq!(
+            parsed,
+            CliAction::Eval {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: None,
+                output_format: CliOutputFormat::Text,
+                max_turns: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eval_args_accepts_session_output_and_max_turns() {
+        let args = vec![
+            "--session".to_string(),
+            "abc123".to_string(),
+            "--output".to_string(),
+            "/tmp/eval.jsonl".to_string(),
+            "--max-turns".to_string(),
+            "42".to_string(),
+        ];
+        let parsed = parse_eval_args(&args, CliOutputFormat::Json).expect("eval args parse");
+        assert_eq!(
+            parsed,
+            CliAction::Eval {
+                session_reference: "abc123".to_string(),
+                output_path: Some(PathBuf::from("/tmp/eval.jsonl")),
+                output_format: CliOutputFormat::Json,
+                max_turns: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eval_args_supports_inline_flag_syntax() {
+        let args = vec![
+            "--session=abc123".to_string(),
+            "--output=/tmp/eval.jsonl".to_string(),
+            "--max-turns=5".to_string(),
+        ];
+        let parsed = parse_eval_args(&args, CliOutputFormat::Text).expect("inline eval args parse");
+        assert_eq!(
+            parsed,
+            CliAction::Eval {
+                session_reference: "abc123".to_string(),
+                output_path: Some(PathBuf::from("/tmp/eval.jsonl")),
+                output_format: CliOutputFormat::Text,
+                max_turns: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eval_args_rejects_invalid_max_turns() {
+        let args = vec!["--max-turns".to_string(), "abc".to_string()];
+        let error =
+            parse_eval_args(&args, CliOutputFormat::Text).expect_err("non-numeric max-turns");
+        assert!(error.contains("invalid value for --max-turns"));
+    }
+
+    #[test]
+    fn parse_eval_args_rejects_unknown_option() {
+        let args = vec!["--bogus".to_string()];
+        let error = parse_eval_args(&args, CliOutputFormat::Text)
+            .expect_err("unknown eval option rejected");
+        assert!(error.contains("unknown eval option"));
+    }
+
+    #[test]
+    fn eval_top_level_subcommand_routes_to_eval_action() {
+        let parsed = parse_args(&[
+            "eval".to_string(),
+            "--session".to_string(),
+            "abc123".to_string(),
+        ])
+        .expect("eval subcommand parses");
+        assert_eq!(
+            parsed,
+            CliAction::Eval {
+                session_reference: "abc123".to_string(),
+                output_path: None,
+                output_format: CliOutputFormat::Text,
+                max_turns: None,
+            }
+        );
+    }
+
+    #[test]
+    fn eval_summary_tracks_success_failure_and_model_distribution() {
+        let mut summary = EvalSummary::default();
+        summary.record_success("claude-haiku-4-5", 120, 100, 40);
+        summary.record_success("claude-haiku-4-5", 90, 200, 30);
+        summary.record_success("claude-opus-4-6", 500, 400, 80);
+        summary.record_failure();
+
+        assert_eq!(summary.total_turns, 4);
+        assert_eq!(summary.successful_turns, 3);
+        assert_eq!(summary.failures, 1);
+        assert_eq!(summary.total_latency_ms, 710);
+        assert_eq!(summary.total_input_tokens, 700);
+        assert_eq!(summary.total_output_tokens, 150);
+
+        let rendered = summary.render();
+        assert!(rendered.contains("turns=4"));
+        assert!(rendered.contains("ok=3"));
+        assert!(rendered.contains("failed=1"));
+        // 710 / 3 successful turns = 236
+        assert!(rendered.contains("avg_latency_ms=236"));
+        assert!(rendered.contains("tokens_in=700"));
+        assert!(rendered.contains("tokens_out=150"));
+        assert!(rendered.contains("claude-haiku-4-5=2"));
+        assert!(rendered.contains("claude-opus-4-6=1"));
+    }
+
+    #[test]
+    fn eval_summary_render_with_only_failures_shows_zero_avg_latency() {
+        let mut summary = EvalSummary::default();
+        summary.record_failure();
+        summary.record_failure();
+        let rendered = summary.render();
+        assert!(rendered.contains("turns=2"));
+        assert!(rendered.contains("ok=0"));
+        assert!(rendered.contains("failed=2"));
+        assert!(rendered.contains("avg_latency_ms=0"));
+    }
+
+    #[test]
+    fn eval_summary_accumulates_cost_using_pricing_for_model() {
+        let mut summary = EvalSummary::default();
+        // Haiku at $1/M input, $5/M output: 10_000 in + 2_000 out =
+        // 10_000 + 10_000 = 20_000 micro-dollars = $0.02.
+        summary.record_success("claude-haiku-4-5", 100, 10_000, 2_000);
+        // Opus at $15/M input, $75/M output: 1_000 in + 500 out =
+        // 15_000 + 37_500 = 52_500 micro-dollars = $0.0525.
+        summary.record_success("claude-opus-4-6", 400, 1_000, 500);
+        let expected_micros: u64 = 20_000 + 52_500;
+        assert_eq!(summary.total_cost_micros, expected_micros);
+        #[allow(clippy::cast_precision_loss)]
+        let expected_usd = (expected_micros as f64) / 1_000_000.0;
+        assert!((summary.total_cost_usd() - expected_usd).abs() < 1e-9);
+        let rendered = summary.render();
+        assert!(
+            rendered.contains("cost=$"),
+            "render should include cost: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cost_micros_for_returns_zero_for_unknown_models() {
+        assert_eq!(cost_micros_for("random-model", 1_000, 1_000), 0);
+    }
+
+    #[test]
+    fn cost_micros_for_uses_haiku_pricing() {
+        // $1/M input + $5/M output on 1_000_000 in / 1_000_000 out = $6.
+        let cost = cost_micros_for("claude-haiku-4-5", 1_000_000, 1_000_000);
+        assert_eq!(cost, 6_000_000);
+    }
+
+    #[test]
+    fn truncate_for_log_appends_ellipsis_past_cap() {
+        let long_input = "a".repeat(300);
+        let truncated = truncate_for_log(&long_input, 200);
+        assert_eq!(truncated.chars().count(), 203);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_for_log_leaves_short_inputs_intact() {
+        assert_eq!(truncate_for_log("  hello  ", 200), "hello");
+    }
+
+    #[test]
+    fn prompt_bucket_picks_latest_user_message_length() {
+        use eval_router::PromptBucket;
+        use runtime::{ApiRequest, ContentBlock, ConversationMessage, MessageRole};
+
+        // Earlier user message is long, but the latest (what the router
+        // should key on) is short → expect Short.
+        let request = ApiRequest {
+            system_prompt: vec![],
+            messages: vec![
+                ConversationMessage {
+                    role: MessageRole::User,
+                    blocks: vec![ContentBlock::Text {
+                        text: "a".repeat(10_000),
+                    }],
+                    usage: None,
+                },
+                ConversationMessage {
+                    role: MessageRole::Assistant,
+                    blocks: vec![ContentBlock::Text {
+                        text: "ok".to_string(),
+                    }],
+                    usage: None,
+                },
+                ConversationMessage {
+                    role: MessageRole::User,
+                    blocks: vec![ContentBlock::Text {
+                        text: "hi".to_string(),
+                    }],
+                    usage: None,
+                },
+            ],
+        };
+        assert_eq!(prompt_bucket_for_request(&request), PromptBucket::Short);
+    }
+
+    #[test]
+    fn prompt_bucket_defaults_to_short_when_no_user_messages() {
+        use eval_router::PromptBucket;
+        use runtime::ApiRequest;
+
+        let request = ApiRequest {
+            system_prompt: vec![],
+            messages: vec![],
+        };
+        assert_eq!(prompt_bucket_for_request(&request), PromptBucket::Short);
+    }
+
+    #[test]
+    fn prompt_bucket_counts_chars_across_multiple_text_blocks() {
+        use eval_router::PromptBucket;
+        use runtime::{ApiRequest, ContentBlock, ConversationMessage, MessageRole};
+
+        let request = ApiRequest {
+            system_prompt: vec![],
+            messages: vec![ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![
+                    ContentBlock::Text {
+                        text: "a".repeat(400),
+                    },
+                    ContentBlock::Text {
+                        text: "b".repeat(200),
+                    },
+                ],
+                usage: None,
+            }],
+        };
+        // 600 total chars → Medium bucket (>=512, <6000).
+        assert_eq!(prompt_bucket_for_request(&request), PromptBucket::Medium);
+    }
+
+    #[test]
+    fn tokens_from_events_returns_last_usage_event() {
+        use runtime::TokenUsage;
+
+        let events = vec![
+            AssistantEvent::TextDelta("partial".to_string()),
+            AssistantEvent::Usage(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            AssistantEvent::TextDelta("more".to_string()),
+            AssistantEvent::Usage(TokenUsage {
+                input_tokens: 120,
+                output_tokens: 75,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            AssistantEvent::MessageStop,
+        ];
+        assert_eq!(tokens_from_events(&events), (120, 75));
+    }
+
+    #[test]
+    fn tokens_from_events_returns_zero_when_no_usage_events() {
+        let events = vec![
+            AssistantEvent::TextDelta("hello".to_string()),
+            AssistantEvent::MessageStop,
+        ];
+        assert_eq!(tokens_from_events(&events), (0, 0));
+    }
+
+    #[test]
+    fn flatten_user_text_joins_text_blocks_and_skips_non_text() {
+        let message = ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "first".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "ignored".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "second".to_string(),
+                },
+            ],
+            usage: None,
+        };
+        assert_eq!(flatten_user_text(&message), "first\nsecond");
     }
 }
 
