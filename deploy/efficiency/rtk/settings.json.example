@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      "~/.claw/hooks/rtk.sh"
+    ]
+  }
+}
