@@ -32,14 +32,35 @@ impl ProviderClient {
                 OpenAiCompatConfig::xai(),
             )?)),
             ProviderKind::OpenAi => {
-                // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
-                // speak the OpenAI wire format, but they need the DashScope config which
-                // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
+                // Multiple backends share the OpenAI Chat Completions wire format
+                // but need different base URLs and auth env vars:
+                //   - DashScope (qwen-*, kimi-*) reads DASHSCOPE_API_KEY
+                //   - Gemini/Gemma (gemini-*, gemma-*) reads GEMINI_API_KEY
+                //     (or GOOGLE_API_KEY) and points at GCP agent-platform
+                //   - Everything else (gpt-*, openai/*, generic OpenAI-compat
+                //     local servers) reads OPENAI_API_KEY
+                // Prefer explicit metadata (model-prefix routing) first; only
+                // fall back to env-var sniffing for bare model names so users
+                // with just GEMINI_API_KEY exported still get the right backend.
                 let config = match providers::metadata_for_model(&resolved_model) {
                     Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
                         OpenAiCompatConfig::dashscope()
                     }
-                    _ => OpenAiCompatConfig::openai(),
+                    Some(meta) if meta.auth_env == "GEMINI_API_KEY" => OpenAiCompatConfig::gemini(),
+                    Some(_) => OpenAiCompatConfig::openai(),
+                    None => {
+                        if openai_compat::has_api_key("OPENAI_API_KEY") {
+                            OpenAiCompatConfig::openai()
+                        } else if openai_compat::has_api_key("GEMINI_API_KEY")
+                            || openai_compat::has_api_key("GOOGLE_API_KEY")
+                        {
+                            OpenAiCompatConfig::gemini()
+                        } else if openai_compat::has_api_key("DASHSCOPE_API_KEY") {
+                            OpenAiCompatConfig::dashscope()
+                        } else {
+                            OpenAiCompatConfig::openai()
+                        }
+                    }
                 };
                 Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
             }
@@ -201,6 +222,69 @@ mod tests {
                 Some(value) => std::env::set_var(self.key, value),
                 None => std::env::remove_var(self.key),
             }
+        }
+    }
+
+    #[test]
+    fn gemini_model_uses_gemini_config_not_openai() {
+        // Regression guard: gemini-2.5-flash and gemma-3-27b-it must route
+        // through OpenAiCompatConfig::gemini() (GEMINI_API_KEY +
+        // generativelanguage.googleapis.com), not the default OpenAI config
+        // that reads OPENAI_API_KEY and points at api.openai.com.
+        let _lock = env_lock();
+        let _gemini = EnvVarGuard::set("GEMINI_API_KEY", Some("test-gemini-key"));
+        let _google = EnvVarGuard::set("GOOGLE_API_KEY", None);
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _openai_base = EnvVarGuard::set("OPENAI_BASE_URL", None);
+        let _gemini_base = EnvVarGuard::set("GEMINI_BASE_URL", None);
+
+        for model in ["gemini-2.5-flash", "gemini-pro", "gemma-3-27b-it"] {
+            let client = ProviderClient::from_model(model)
+                .unwrap_or_else(|err| panic!("`{model}` should build with GEMINI_API_KEY: {err}"));
+            match client {
+                ProviderClient::OpenAi(openai_client) => {
+                    assert!(
+                        openai_client
+                            .base_url()
+                            .contains("generativelanguage.googleapis.com"),
+                        "`{model}` should route to the Google AI base URL, got: {}",
+                        openai_client.base_url()
+                    );
+                }
+                other => panic!("Expected ProviderClient::OpenAi for `{model}`, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_base_url_override_targets_vertex_endpoint() {
+        // Vertex AI users override GEMINI_BASE_URL with their project-scoped
+        // endpoint (the GCP agent-platform model API URL). The override must
+        // win over the AI Studio default so a Bearer access token from
+        // `gcloud auth print-access-token` reaches the project endpoint.
+        let _lock = env_lock();
+        let _gemini = EnvVarGuard::set("GEMINI_API_KEY", Some("ya29.fake-access-token"));
+        let _vertex_base = EnvVarGuard::set(
+            "GEMINI_BASE_URL",
+            Some("https://us-central1-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-central1/endpoints/openapi"),
+        );
+        let _google = EnvVarGuard::set("GOOGLE_API_KEY", None);
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+
+        let client =
+            ProviderClient::from_model("gemini-2.5-pro").expect("should build with override");
+        match client {
+            ProviderClient::OpenAi(openai_client) => {
+                assert!(
+                    openai_client
+                        .base_url()
+                        .contains("aiplatform.googleapis.com")
+                        && openai_client.base_url().contains("/projects/my-proj/"),
+                    "GEMINI_BASE_URL override must target Vertex endpoint, got: {}",
+                    openai_client.base_url()
+                );
+            }
+            other => panic!("Expected ProviderClient::OpenAi, got: {other:?}"),
         }
     }
 

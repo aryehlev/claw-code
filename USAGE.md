@@ -175,6 +175,32 @@ cd rust
 ./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
 ```
 
+### Google Gemini & Gemma (GCP agent-platform model APIs)
+
+For Google's Gemini and Gemma model families via the GCP agent-platform model APIs (and the AI Studio Gemini API, which exposes the same models over the same OpenAI-compatible wire format):
+
+```bash
+export GEMINI_API_KEY="..."   # or GOOGLE_API_KEY (both are accepted)
+
+cd rust
+./target/debug/claw --model "gemini-2.5-pro" prompt "hello"
+./target/debug/claw --model "gemini-flash" prompt "hello"   # alias → gemini-2.5-flash
+./target/debug/claw --model "gemma-3-27b-it" prompt "hello"
+```
+
+Model names starting with `gemini-`, `gemini/`, `gemma-`, `gemma/`, or `google/` are automatically routed to the Google OpenAI-compatible endpoint (`https://generativelanguage.googleapis.com/v1beta/openai`). You do **not** need to set `OPENAI_BASE_URL` or unset other credentials — the model prefix wins over the ambient credential sniffer.
+
+**Vertex AI / GCP agent-platform with a service-account access token:**
+Override `GEMINI_BASE_URL` with your project-scoped Vertex endpoint and put a `gcloud auth print-access-token` bearer in `GEMINI_API_KEY`:
+
+```bash
+export GEMINI_API_KEY="$(gcloud auth print-access-token)"
+export GEMINI_BASE_URL="https://us-central1-aiplatform.googleapis.com/v1/projects/MY-PROJECT/locations/us-central1/endpoints/openapi"
+
+cd rust
+./target/debug/claw --model "gemini-2.5-pro" prompt "hello"
+```
+
 ### Alibaba DashScope (Qwen)
 
 For Qwen models via Alibaba's native DashScope API (higher rate limits than OpenRouter):
@@ -204,10 +230,11 @@ Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `te
 | **xAI** | OpenAI-compatible | `XAI_API_KEY` | `XAI_BASE_URL` | `https://api.x.ai/v1` |
 | **OpenAI-compatible** | OpenAI Chat Completions | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
 | **DashScope** (Alibaba) | OpenAI-compatible | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| **Google** (Gemini / Gemma / GCP agent-platform) | OpenAI-compatible | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 
 The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — just point `OPENAI_BASE_URL` at the service.
 
-**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
+**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, `qwen-`, `kimi/`, `kimi-`, `gemini-`, `gemini/`, `gemma-`, `gemma/`, or `google/`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
 
 ### Tested models and aliases
 
@@ -221,6 +248,9 @@ These are the models registered in the built-in alias table with known token lim
 | `grok` / `grok-3` | `grok-3` | xAI | 64 000 | 131 072 |
 | `grok-mini` / `grok-3-mini` | `grok-3-mini` | xAI | 64 000 | 131 072 |
 | `grok-2` | `grok-2` | xAI | — | — |
+| `gemini` / `gemini-flash` | `gemini-2.5-flash` | Google | 65 536 | 1 048 576 |
+| `gemini-pro` | `gemini-2.5-pro` | Google | 65 536 | 1 048 576 |
+| `gemma` | `gemma-3-27b-it` | Google | 8 192 | 131 072 |
 
 Any model name that does not match an alias is passed through verbatim. This is how you use OpenRouter model slugs (`openai/gpt-4.1-mini`), Ollama tags (`llama3.2`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
 

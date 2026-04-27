@@ -19,6 +19,13 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+/// Google's OpenAI-compatible Chat Completions endpoint. Serves Gemini and
+/// Gemma model families through the GCP agent-platform model APIs and the
+/// AI Studio Gemini API. Override with `GEMINI_BASE_URL` to target Vertex
+/// AI's per-project endpoint
+/// (`https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{LOCATION}/endpoints/openapi`)
+/// when using a `gcloud auth print-access-token` bearer instead of an API key.
+pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -41,11 +48,13 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const GEMINI_ENV_VARS: &[&str] = &["GEMINI_API_KEY", "GOOGLE_API_KEY"];
 
 // Provider-specific request body size limits in bytes
 const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
+const GEMINI_MAX_REQUEST_BODY_BYTES: usize = 20_971_520; // 20MB (Google AI Studio docs cap)
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -85,12 +94,30 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// Google's OpenAI-compatible Chat Completions endpoint (Gemini + Gemma).
+    /// Serves both the AI Studio Gemini API and — when `GEMINI_BASE_URL` is
+    /// pointed at a project-scoped Vertex AI URL — the GCP agent-platform
+    /// model APIs. The `api_key` field is sent as a bearer token, which works
+    /// with both AI Studio API keys and `gcloud auth print-access-token`
+    /// access tokens for Vertex AI.
+    #[must_use]
+    pub const fn gemini() -> Self {
+        Self {
+            provider_name: "Gemini",
+            api_key_env: "GEMINI_API_KEY",
+            base_url_env: "GEMINI_BASE_URL",
+            default_base_url: DEFAULT_GEMINI_BASE_URL,
+            max_request_body_bytes: GEMINI_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "Gemini" => GEMINI_ENV_VARS,
             _ => &[],
         }
     }
@@ -130,7 +157,23 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+        // Try the primary env var first, then fall through to any alternates
+        // listed in `credential_env_vars()`. Only Gemini currently has more
+        // than one (GEMINI_API_KEY → GOOGLE_API_KEY); for single-env providers
+        // this preserves the prior behavior exactly.
+        let mut api_key = read_env_non_empty(config.api_key_env)?;
+        if api_key.is_none() {
+            for alt in config.credential_env_vars() {
+                if *alt == config.api_key_env {
+                    continue;
+                }
+                if let Some(value) = read_env_non_empty(alt)? {
+                    api_key = Some(value);
+                    break;
+                }
+            }
+        }
+        let Some(api_key) = api_key else {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
@@ -801,7 +844,10 @@ fn strip_routing_prefix(model: &str) -> &str {
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
         // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
+        if matches!(
+            prefix,
+            "openai" | "xai" | "grok" | "qwen" | "kimi" | "google" | "gemini" | "gemma"
+        ) {
             &model[pos + 1..]
         } else {
             model
@@ -2195,9 +2241,16 @@ mod tests {
 
     #[test]
     fn provider_specific_size_limits_are_correct() {
-        assert_eq!(OpenAiCompatConfig::dashscope().max_request_body_bytes, 6_291_456); // 6MB
-        assert_eq!(OpenAiCompatConfig::openai().max_request_body_bytes, 104_857_600); // 100MB
-        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800); // 50MB
+        assert_eq!(
+            OpenAiCompatConfig::dashscope().max_request_body_bytes,
+            6_291_456
+        ); // 6MB
+        assert_eq!(
+            OpenAiCompatConfig::openai().max_request_body_bytes,
+            104_857_600
+        ); // 100MB
+        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800);
+        // 50MB
     }
 
     #[test]

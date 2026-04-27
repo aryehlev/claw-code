@@ -131,6 +131,48 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         },
     ),
+    // Google's GCP agent-platform model APIs (Gemini + Gemma families) ride
+    // on the OpenAI-compatible Chat Completions endpoint at
+    // generativelanguage.googleapis.com. Same wire format, just a different
+    // base URL and auth env. ProviderKind::OpenAi handles the transport;
+    // metadata_for_model picks OpenAiCompatConfig::gemini() so we point at
+    // the Google base URL and read GEMINI_API_KEY (or GOOGLE_API_KEY).
+    (
+        "gemini",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "GEMINI_API_KEY",
+            base_url_env: "GEMINI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GEMINI_BASE_URL,
+        },
+    ),
+    (
+        "gemini-pro",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "GEMINI_API_KEY",
+            base_url_env: "GEMINI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GEMINI_BASE_URL,
+        },
+    ),
+    (
+        "gemini-flash",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "GEMINI_API_KEY",
+            base_url_env: "GEMINI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GEMINI_BASE_URL,
+        },
+    ),
+    (
+        "gemma",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "GEMINI_API_KEY",
+            base_url_env: "GEMINI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GEMINI_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -155,6 +197,9 @@ pub fn resolve_model_alias(model: &str) -> String {
                 },
                 ProviderKind::OpenAi => match *alias {
                     "kimi" => "kimi-k2.5",
+                    "gemini" | "gemini-flash" => "gemini-2.5-flash",
+                    "gemini-pro" => "gemini-2.5-pro",
+                    "gemma" => "gemma-3-27b-it",
                     _ => trimmed,
                 },
             })
@@ -216,6 +261,25 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // Google's GCP agent-platform model APIs (Gemini + Gemma) speak the
+    // OpenAI Chat Completions wire format. Route every name with one of the
+    // canonical Google prefixes (`gemini-*`, `gemma-*`, `google/*`,
+    // `gemini/*`, `gemma/*`) to the OpenAI-compat client pointed at
+    // generativelanguage.googleapis.com — overridable via GEMINI_BASE_URL
+    // for Vertex AI's project-scoped endpoint.
+    if canonical.starts_with("gemini/")
+        || canonical.starts_with("gemini-")
+        || canonical.starts_with("gemma/")
+        || canonical.starts_with("gemma-")
+        || canonical.starts_with("google/")
+    {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "GEMINI_API_KEY",
+            base_url_env: "GEMINI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GEMINI_BASE_URL,
+        });
+    }
     None
 }
 
@@ -241,6 +305,17 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
+    }
+    // GCP agent-platform models share the OpenAI wire format, so we route
+    // them through ProviderKind::OpenAi. The dispatcher in client.rs picks
+    // OpenAiCompatConfig::gemini() based on metadata_for_model, but the
+    // sniffer here only fires for unprefixed model names (e.g. a user
+    // setting model="ready" while exporting GEMINI_API_KEY); in that case
+    // we still want the request to go to Google rather than fall through
+    // to Anthropic.
+    if openai_compat::has_api_key("GEMINI_API_KEY") || openai_compat::has_api_key("GOOGLE_API_KEY")
+    {
+        return ProviderKind::OpenAi;
     }
     // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
     // local providers like Ollama don't require auth), still route there.
@@ -294,6 +369,19 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
+        }),
+        // Google Gemini 2.5 family. Source:
+        // https://ai.google.dev/gemini-api/docs/models — 1M-token context,
+        // 65 536-token output cap on both Pro and Flash as of 2025-Q4.
+        "gemini-2.5-pro" | "gemini-2.5-flash" | "gemini-2.5-flash-lite" => Some(ModelTokenLimit {
+            max_output_tokens: 65_536,
+            context_window_tokens: 1_048_576,
+        }),
+        // Gemma 3 instruct variants on the Gemini API. 128k context window
+        // and 8k output cap per the published model card.
+        "gemma-3-27b-it" | "gemma-3-12b-it" | "gemma-3-4b-it" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
         }),
         _ => None,
     }
@@ -352,6 +440,16 @@ const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
         "DASHSCOPE_API_KEY",
         "Alibaba DashScope",
         "prefix your model name with `qwen/` or `qwen-` (e.g. `--model qwen-plus`) so prefix routing selects the DashScope backend",
+    ),
+    (
+        "GEMINI_API_KEY",
+        "Google Gemini / GCP agent-platform",
+        "use a Gemini or Gemma model alias (e.g. `--model gemini-2.5-pro`, `--model gemini-flash`, `--model gemma-3-27b-it`) so prefix routing selects the Google backend",
+    ),
+    (
+        "GOOGLE_API_KEY",
+        "Google Gemini / GCP agent-platform",
+        "use a Gemini or Gemma model alias (e.g. `--model gemini-2.5-pro`, `--model gemini-flash`) so prefix routing selects the Google backend",
     ),
 ];
 
@@ -753,14 +851,14 @@ mod tests {
     #[test]
     fn returns_context_window_metadata_for_kimi_models() {
         // kimi-k2.5
-        let k25_limit = model_token_limit("kimi-k2.5")
-            .expect("kimi-k2.5 should have token limit metadata");
+        let k25_limit =
+            model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have token limit metadata");
         assert_eq!(k25_limit.max_output_tokens, 16_384);
         assert_eq!(k25_limit.context_window_tokens, 256_000);
 
         // kimi-k1.5
-        let k15_limit = model_token_limit("kimi-k1.5")
-            .expect("kimi-k1.5 should have token limit metadata");
+        let k15_limit =
+            model_token_limit("kimi-k1.5").expect("kimi-k1.5 should have token limit metadata");
         assert_eq!(k15_limit.max_output_tokens, 16_384);
         assert_eq!(k15_limit.context_window_tokens, 256_000);
     }
@@ -768,11 +866,13 @@ mod tests {
     #[test]
     fn kimi_alias_resolves_to_kimi_k25_token_limits() {
         // The "kimi" alias resolves to "kimi-k2.5" via resolve_model_alias()
-        let alias_limit = model_token_limit("kimi")
-            .expect("kimi alias should resolve to kimi-k2.5 limits");
-        let direct_limit = model_token_limit("kimi-k2.5")
-            .expect("kimi-k2.5 should have limits");
-        assert_eq!(alias_limit.max_output_tokens, direct_limit.max_output_tokens);
+        let alias_limit =
+            model_token_limit("kimi").expect("kimi alias should resolve to kimi-k2.5 limits");
+        let direct_limit = model_token_limit("kimi-k2.5").expect("kimi-k2.5 should have limits");
+        assert_eq!(
+            alias_limit.max_output_tokens,
+            direct_limit.max_output_tokens
+        );
         assert_eq!(
             alias_limit.context_window_tokens,
             direct_limit.context_window_tokens
@@ -1141,4 +1241,107 @@ NO_EQUALS_LINE
     // (env_lock only protects within a single binary). The detection logic
     // is covered: OPENAI_BASE_URL alone routes to OpenAi as a last-resort
     // fallback in detect_provider_kind().
+
+    #[test]
+    fn resolves_gemini_aliases() {
+        assert_eq!(resolve_model_alias("gemini"), "gemini-2.5-flash");
+        assert_eq!(resolve_model_alias("gemini-flash"), "gemini-2.5-flash");
+        assert_eq!(resolve_model_alias("gemini-pro"), "gemini-2.5-pro");
+        assert_eq!(resolve_model_alias("gemma"), "gemma-3-27b-it");
+        // Pass-through for fully-qualified names.
+        assert_eq!(
+            resolve_model_alias("gemini-2.5-flash-lite"),
+            "gemini-2.5-flash-lite"
+        );
+    }
+
+    #[test]
+    fn gemini_prefix_routes_to_google_not_anthropic() {
+        // The GCP agent-platform model APIs (Gemini + Gemma) ride on the
+        // OpenAI-compatible Chat Completions endpoint. metadata_for_model
+        // must route gemini-*, gemini/*, gemma-*, gemma/*, and google/*
+        // to ProviderKind::OpenAi pointed at GEMINI_API_KEY +
+        // generativelanguage.googleapis.com regardless of which other
+        // provider credentials happen to be in the environment.
+        for model in [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini/gemini-2.5-pro",
+            "gemma-3-27b-it",
+            "gemma/gemma-3-27b-it",
+            "google/gemini-2.5-pro",
+        ] {
+            let meta = super::metadata_for_model(model)
+                .unwrap_or_else(|| panic!("expected Gemini metadata for `{model}`"));
+            assert_eq!(meta.provider, ProviderKind::OpenAi);
+            assert_eq!(meta.auth_env, "GEMINI_API_KEY");
+            assert_eq!(meta.base_url_env, "GEMINI_BASE_URL");
+            assert!(
+                meta.default_base_url
+                    .contains("generativelanguage.googleapis.com"),
+                "expected default base URL to point at the Google AI endpoint, got `{}`",
+                meta.default_base_url
+            );
+        }
+    }
+
+    #[test]
+    fn detect_provider_kind_picks_google_when_only_gemini_key_set() {
+        // Mirrors the qwen/dashscope sniffer: a user who has only
+        // GEMINI_API_KEY exported and types a bare model name should land
+        // on the OpenAI-compat path (which client.rs then refines into the
+        // Gemini config).
+        let _lock = env_lock();
+        let _gemini = EnvVarGuard::set("GEMINI_API_KEY", Some("test-gemini-key"));
+        let _google = EnvVarGuard::set("GOOGLE_API_KEY", None);
+        let _anthropic_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+        let _anthropic_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _openai_base = EnvVarGuard::set("OPENAI_BASE_URL", None);
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+
+        assert_eq!(
+            detect_provider_kind("gemini-2.5-flash"),
+            ProviderKind::OpenAi
+        );
+        assert_eq!(
+            detect_provider_kind("some-unprefixed-model"),
+            ProviderKind::OpenAi,
+            "GEMINI_API_KEY alone should route bare model names to OpenAi-compat",
+        );
+    }
+
+    #[test]
+    fn token_limits_registered_for_gemini_2_5() {
+        let pro = model_token_limit("gemini-2.5-pro").expect("Pro limit registered");
+        assert_eq!(pro.context_window_tokens, 1_048_576);
+        let flash = model_token_limit("gemini-2.5-flash").expect("Flash limit registered");
+        assert_eq!(flash.context_window_tokens, 1_048_576);
+        // Aliases resolve through resolve_model_alias before lookup, so the
+        // bare alias should also produce a limit.
+        let aliased =
+            model_token_limit("gemini-pro").expect("alias must resolve before limit lookup");
+        assert_eq!(aliased.context_window_tokens, 1_048_576);
+        // Default-tokens path stays correct for an aliased Gemini model.
+        assert_eq!(max_tokens_for_model("gemini-flash"), 65_536);
+    }
+
+    #[test]
+    fn anthropic_missing_credentials_hint_mentions_gemini() {
+        let _lock = env_lock();
+        let _anthropic_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+        let _anthropic_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+        let _gemini = EnvVarGuard::set("GEMINI_API_KEY", Some("test-key"));
+        let _google = EnvVarGuard::set("GOOGLE_API_KEY", None);
+
+        let hint = anthropic_missing_credentials_hint()
+            .expect("hint should fire when GEMINI_API_KEY is the only foreign credential");
+        assert!(
+            hint.contains("GEMINI_API_KEY") && hint.contains("gemini-"),
+            "hint should mention the env var and a `gemini-*` model alias, got: {hint}"
+        );
+    }
 }
